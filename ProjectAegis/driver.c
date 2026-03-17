@@ -1,6 +1,6 @@
 //
 // Project Aegis - Kernel driver main module
-// Phase 1: Hello World + IOCTL for Ring 3 communication.
+// Phase 1: IOCTL; Phase 2: process/thread/image callbacks (no SSDT hook).
 // Target: Windows 10/11 x64. Develop and test in a VM; use dual-machine debugging.
 //
 
@@ -20,6 +20,19 @@ const wchar_t* AegisDefaultProtectedNames[] = {
     L"TestProtected.exe",
 };
 const ULONG AegisDefaultProtectedCount = sizeof(AegisDefaultProtectedNames) / sizeof(AegisDefaultProtectedNames[0]);
+
+// -----------------------------------------------
+// Blacklist: cheat/debug tools to block from starting (Phase 2 - process notify)
+// -----------------------------------------------
+const wchar_t* AegisBlacklistProcessNames[] = {
+    L"cheatengine-x86_64.exe",
+    L"cheatengine-i386.exe",
+    L"Cheat Engine.exe",
+    L"x64dbg.exe",
+    L"x32dbg.exe",
+    L"ollydbg.exe",
+};
+const ULONG AegisBlacklistProcessCount = sizeof(AegisBlacklistProcessNames) / sizeof(AegisBlacklistProcessNames[0]);
 
 // -----------------------------------------------
 // PID list (dynamic via IOCTL); protected PIDs added by user-mode client
@@ -42,7 +55,17 @@ static void AegisProcessNotifyCallback(
     _In_ HANDLE ProcessId,
     _In_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo
 );
-static BOOLEAN g_AegisCallbacksRegistered = FALSE;
+static void AegisThreadNotifyCallback(_In_ HANDLE ProcessId, _In_ HANDLE ThreadId, _In_ BOOLEAN Create);
+static void AegisLoadImageNotifyCallback(
+    _In_opt_ PUNICODE_STRING FullImageName,
+    _In_ HANDLE ProcessId,
+    _In_ PIMAGE_INFO ImageInfo
+);
+static BOOLEAN g_AegisProcessNotifyRegistered = FALSE;
+static BOOLEAN g_AegisThreadNotifyRegistered = FALSE;
+static BOOLEAN g_AegisImageNotifyRegistered = FALSE;
+
+static BOOLEAN AegisIsProcessBlacklisted(PCUNICODE_STRING ImageName);
 
 // -----------------------------------------------
 // DriverEntry / Unload
@@ -109,13 +132,13 @@ NTSTATUS DriverEntry(
         AegisProtectionUninitialize();
         return status;
     }
-    g_AegisCallbacksRegistered = TRUE;
+    g_AegisProcessNotifyRegistered = TRUE;
 
     status = AegisRegisterCallbacks();
     if (!NT_SUCCESS(status)) {
         AegisDbgPrint(("[Aegis] AegisRegisterCallbacks failed: 0x%X\n", status));
         PsSetCreateProcessNotifyRoutineEx(AegisProcessNotifyCallback, TRUE);
-        g_AegisCallbacksRegistered = FALSE;
+        g_AegisProcessNotifyRegistered = FALSE;
         IoDeleteSymbolicLink(&linkName);
         IoDeleteDevice(g_AegisDeviceObject);
         g_AegisDeviceObject = NULL;
@@ -134,9 +157,9 @@ void DriverUnload(_In_ PDRIVER_OBJECT DriverObject)
     AegisDbgPrint(("[Aegis] DriverUnload\n"));
 
     AegisUnregisterCallbacks();
-    if (g_AegisCallbacksRegistered) {
+    if (g_AegisProcessNotifyRegistered) {
         PsSetCreateProcessNotifyRoutineEx(AegisProcessNotifyCallback, TRUE);
-        g_AegisCallbacksRegistered = FALSE;
+        g_AegisProcessNotifyRegistered = FALSE;
     }
 
     RtlInitUnicodeString(&linkName, AEGIS_LINK_NAME);
@@ -324,16 +347,55 @@ BOOLEAN AegisIsProcessProtectedByImageName(PCUNICODE_STRING ImageName)
 
 NTSTATUS AegisRegisterCallbacks(void)
 {
+    NTSTATUS status;
+
+    status = PsSetCreateThreadNotifyRoutine(AegisThreadNotifyCallback);
+    if (!NT_SUCCESS(status)) {
+        AegisDbgPrint(("[Aegis] PsSetCreateThreadNotifyRoutine failed: 0x%X\n", status));
+        return status;
+    }
+    g_AegisThreadNotifyRegistered = TRUE;
+
+    status = PsSetLoadImageNotifyRoutine(AegisLoadImageNotifyCallback);
+    if (!NT_SUCCESS(status)) {
+        AegisDbgPrint(("[Aegis] PsSetLoadImageNotifyRoutine failed: 0x%X\n", status));
+        PsRemoveCreateThreadNotifyRoutine(AegisThreadNotifyCallback);
+        g_AegisThreadNotifyRegistered = FALSE;
+        return status;
+    }
+    g_AegisImageNotifyRegistered = TRUE;
+
     return STATUS_SUCCESS;
 }
 
 void AegisUnregisterCallbacks(void)
 {
+    if (g_AegisImageNotifyRegistered) {
+        PsRemoveLoadImageNotifyRoutine(AegisLoadImageNotifyCallback);
+        g_AegisImageNotifyRegistered = FALSE;
+    }
+    if (g_AegisThreadNotifyRegistered) {
+        PsRemoveCreateThreadNotifyRoutine(AegisThreadNotifyCallback);
+        g_AegisThreadNotifyRegistered = FALSE;
+    }
 }
 
 // -----------------------------------------------
-// Process notify
+// Task 1: Process notify – blacklist and block; log protected process creation
 // -----------------------------------------------
+static BOOLEAN AegisIsProcessBlacklisted(PCUNICODE_STRING ImageName)
+{
+    ULONG i;
+    if (ImageName == NULL || ImageName->Buffer == NULL) return FALSE;
+    for (i = 0; i < AegisBlacklistProcessCount; i++) {
+        UNICODE_STRING u;
+        RtlInitUnicodeString(&u, AegisBlacklistProcessNames[i]);
+        if (RtlCompareUnicodeString(ImageName, &u, TRUE) == 0)
+            return TRUE;
+    }
+    return FALSE;
+}
+
 static void AegisProcessNotifyCallback(
     _Inout_ PEPROCESS Process,
     _In_ HANDLE ProcessId,
@@ -343,9 +405,63 @@ static void AegisProcessNotifyCallback(
     UNREFERENCED_PARAMETER(Process);
     UNREFERENCED_PARAMETER(ProcessId);
 
-    if (CreateInfo != NULL && CreateInfo->ImageFileName != NULL) {
+    if (CreateInfo == NULL)
+        return;
+
+    if (CreateInfo->ImageFileName != NULL) {
+        if (AegisIsProcessBlacklisted(CreateInfo->ImageFileName)) {
+            AegisDbgPrint(("[Aegis] Blocking blacklisted process: %wZ\n", CreateInfo->ImageFileName));
+            CreateInfo->CreationStatus = STATUS_ACCESS_DENIED;
+        }
         if (AegisIsProcessProtectedByImageName(CreateInfo->ImageFileName)) {
             AegisDbgPrint(("[Aegis] Protected process created: %wZ\n", CreateInfo->ImageFileName));
         }
     }
+}
+
+// -----------------------------------------------
+// Task 2: Thread notify – detect and terminate remote threads in protected processes
+// -----------------------------------------------
+static void AegisThreadNotifyCallback(_In_ HANDLE ProcessId, _In_ HANDLE ThreadId, _In_ BOOLEAN Create)
+{
+    HANDLE threadHandle = NULL;
+    CLIENT_ID cid;
+    OBJECT_ATTRIBUTES oa;
+
+    if (!Create)
+        return;
+    if (!AegisIsProcessProtectedByPid(ProcessId))
+        return;
+    /* Remote thread: creator is not the process that owns the new thread. */
+    if (PsGetCurrentProcessId() == ProcessId)
+        return;
+
+    AegisDbgPrint(("[Aegis] Remote thread in protected process PID %p TID %p – terminating\n", ProcessId, ThreadId));
+
+    InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+    cid.UniqueProcess = ProcessId;
+    cid.UniqueThread = ThreadId;
+
+    if (!NT_SUCCESS(ZwOpenThread(&threadHandle, THREAD_TERMINATE, &oa, &cid)))
+        return;
+    ZwTerminateThread(threadHandle, STATUS_ACCESS_DENIED);
+    ZwClose(threadHandle);
+}
+
+// -----------------------------------------------
+// Task 3: Load image notify – log DLL loads into protected process
+// -----------------------------------------------
+static void AegisLoadImageNotifyCallback(
+    _In_opt_ PUNICODE_STRING FullImageName,
+    _In_ HANDLE ProcessId,
+    _In_ PIMAGE_INFO ImageInfo
+)
+{
+    if (FullImageName == NULL || ImageInfo == NULL)
+        return;
+    if (!AegisIsProcessProtectedByPid(ProcessId))
+        return;
+    /* Log any image load (exe or DLL) into protected process; typical injection is DLL. */
+    AegisDbgPrint(("[Aegis] Image loaded into protected PID %p: %wZ (base %p)\n",
+        ProcessId, FullImageName, ImageInfo->ImageBase));
 }

@@ -104,20 +104,38 @@ AegisClient.exe status
 
 ---
 
-## Current implementation (Phase 1)
+## Phase 2: Process and thread monitoring (system callbacks)
 
-- **Driver**: Device `\Device\ProjectAegis`, symbolic link for `\\.\ProjectAegis`, IRP Create/Close/DeviceControl.
-- **IOCTLs**: Protect PID, unprotect PID, get status (protected count); shared definitions in `Shared/shared_ioctl.h`.
-- **Protected list**: PIDs added via IOCTL (plus default image names in code). `AegisIsProcessProtectedByPid` checks the list.
-- **Process notify**: `PsSetCreateProcessNotifyRoutineEx` still used for image-name-based protection.
-- **AegisClient**: Ring 3 console; `protect <PID>`, `unprotect <PID>`, `status`.
+No SSDT hooking (PatchGuard/KPP); only official callback APIs.
+
+**Task 1 – Process notify (`PsSetCreateProcessNotifyRoutineEx`)**  
+- **Blacklist**: Cheat/debug tools (e.g. Cheat Engine, x64dbg) are listed in `AegisBlacklistProcessNames` in `driver.c`.  
+- When a blacklisted image starts, the callback sets `CreateInfo->CreationStatus = STATUS_ACCESS_DENIED` so the process is blocked.  
+- **Note**: The driver is linked with `/INTEGRITYCHECK` so the kernel allows this “deny” usage of the Ex callback.
+
+**Task 2 – Thread notify (`PsSetCreateThreadNotifyRoutine`)**  
+- When a thread is created in a **protected** process and the creating process is **different** (i.e. remote thread, e.g. `CreateRemoteThread` for injection), the driver terminates that thread with `ZwTerminateThread`.  
+- This detects and stops classic DLL injection via remote thread into the game process.
+
+**Task 3 – Load image notify (`PsSetLoadImageNotifyRoutine`)**  
+- When any image (exe or DLL) is loaded into a protected process, the driver logs it (path and base) via `DbgPrint`.  
+- Used to monitor (and later extend to block) unsigned or unwanted DLLs loading into the game.
+
+---
+
+## Current implementation (Phase 1 + Phase 2)
+
+- **Driver**: Device, IOCTL, protected PID list, process/thread/image callbacks (see above).
+- **Process**: Blacklist block + protected-process creation log.
+- **Thread**: Remote threads in protected processes are terminated.
+- **Image**: All image loads into protected processes are logged.
 
 ---
 
 ## Possible extensions
 
 - **Read/write protection**: `ObRegisterCallbacks` to restrict handles, or hook `NtReadVirtualMemory` / `NtWriteVirtualMemory`.
-- **Injection protection**: `PsSetLoadImageNotifyRoutine` to monitor module loads and block DLL injection into protected processes.
+- **Image load**: Block specific DLLs (e.g. unsigned) loading into protected process (e.g. via CI or custom logic).
 - **Dynamic protected list**: Add/remove protected names or PIDs via registry or user-mode IOCTL.
 
 ---
