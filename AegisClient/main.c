@@ -165,12 +165,18 @@ int main(int argc, char** argv)
             NULL
         );
         if (ok && scanOut.StatusCode == 0) {
-            printf("VAD scan PID %u: %u suspicious (unbacked RWX) region(s)\n", in.Pid, scanOut.Count);
+            printf("VAD scan PID %u: %u suspicious (unbacked RWX) region(s), %u PTE-VAD discrepancy(ies)\n",
+                in.Pid, scanOut.Count, scanOut.DiscrepancyCount);
             for (i = 0; i < scanOut.Count; i++) {
                 printf("  [%u] base %p size 0x%zX protect 0x%X type 0x%X\n",
                     i, (void*)(ULONG_PTR)scanOut.Entries[i].BaseAddress,
                     (size_t)scanOut.Entries[i].RegionSize,
                     scanOut.Entries[i].Protect, scanOut.Entries[i].Type);
+            }
+            for (i = 0; i < scanOut.DiscrepancyCount; i++) {
+                printf("  PTE-VAD [%u] VA %p VAD protect 0x%X PTE 0x%llX\n",
+                    i, (void*)(ULONG_PTR)scanOut.Discrepancies[i].Va,
+                    scanOut.Discrepancies[i].VadProtect, (unsigned long long)scanOut.Discrepancies[i].PteValue);
             }
         } else {
             printf("VAD scan failed: status 0x%X, GetLastError %lu\n", scanOut.StatusCode, GetLastError());

@@ -12,10 +12,22 @@
 
 /* Phase 4: VAD-style scan – unbacked RWX detection */
 #define PAGE_EXECUTE_READWRITE  0x40
+#define PAGE_EXECUTE_READ       0x20
+#define PAGE_EXECUTE            0x10
+#define PAGE_EXECUTE_WRITECOPY  0x80
 #define MEM_IMAGE               0x100000
 
-/* Task 2 (optional): CR3 / page table – see docs/Phase4-CR3-PageTables.md.
- * To read current process CR3 when attached: KeStackAttachProcess(Process, &apcState); cr3 = __readcr3(); KeUnstackDetachProcess(&apcState). */
+/* PTE walk: x64 four-level paging (PML4 -> PDPT -> PD -> PT); NX = bit 63 */
+#define AEGIS_PAGE_SIZE         0x1000
+#define AEGIS_PTE_NX            (1ULL << 63)
+#define AEGIS_PTE_PRESENT       1ULL
+#define AEGIS_PDE_PS            (1ULL << 7)   /* 2MB page */
+#define AEGIS_PFN_MASK          0x000FFFFFFFFFF000ULL
+#define AEGIS_VA_PML4_I(va)     (((va) >> 39) & 0x1FF)
+#define AEGIS_VA_PDPT_I(va)     (((va) >> 30) & 0x1FF)
+#define AEGIS_VA_PD_I(va)       (((va) >> 21) & 0x1FF)
+#define AEGIS_VA_PT_I(va)       (((va) >> 12) & 0x1FF)
+#define AEGIS_USER_VA_MAX       0x00007FFFFFFFFFFFULL
 
 #define AEGIS_DEVICE_NAME   L"\\Device\\ProjectAegis"
 #define AEGIS_LINK_NAME     L"\\DosDevices\\ProjectAegis"
@@ -184,6 +196,9 @@ static PVOID g_ObCallbackHandle = NULL;
 static BOOLEAN AegisIsProcessBlacklisted(PCUNICODE_STRING ImageName);
 static BOOLEAN AegisIsProcessWhitelisted(PEPROCESS Process);
 static NTSTATUS AegisScanProcessVad(_In_ ULONG Pid, _Out_ PAEGIS_VAD_SCAN_OUTPUT Output);
+static ULONG64 AegisGetProcessCr3(_In_ PEPROCESS Process);
+static ULONG64 AegisReadPhysical(ULONG64 Pa);
+static ULONG64 AegisPteWalk(ULONG64 Pml4Pa, ULONG_PTR Va);
 static OB_PREOP_CALLBACK_STATUS AegisObPreOperationCallback(
     _In_ PVOID RegistrationContext,
     _Inout_ POB_PRE_OPERATION_INFORMATION OperationInformation
@@ -438,9 +453,66 @@ static NTSTATUS AegisDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In
 }
 
 // -----------------------------------------------
-// Phase 4: VAD-style scan – enumerate VM regions, flag unbacked RWX (manual map heuristic)
-// Optional extension: hash first N bytes of each RWX region and query a second Bloom filter
-// of known-bad code signatures for O(1) fingerprint match without linear feature scan.
+// PTE walk: get CR3 (PML4 base) by attaching to process and reading CR3 register
+// -----------------------------------------------
+static ULONG64 AegisGetProcessCr3(_In_ PEPROCESS Process)
+{
+    KAPC_STATE apcState;
+    ULONG64 cr3;
+
+    if (Process == NULL) return 0;
+    KeStackAttachProcess(Process, &apcState);
+    cr3 = __readcr3();
+    KeUnstackDetachProcess(&apcState);
+    /* CR3 bits 12-51 = PML4 physical base (4-level paging) */
+    return cr3 & AEGIS_PFN_MASK;
+}
+
+/* Map one physical page and read 8 bytes at Pa (must be 8-byte aligned). */
+static ULONG64 AegisReadPhysical(ULONG64 Pa)
+{
+    PHYSICAL_ADDRESS phys;
+    PVOID mapped;
+    ULONG64 value;
+
+    phys.QuadPart = (LONGLONG)(Pa & ~0xFFFULL);
+    mapped = MmMapIoSpace(phys, AEGIS_PAGE_SIZE, MmNonCached);
+    if (mapped == NULL) return 0;
+    value = *(ULONG64*)((PUCHAR)mapped + (Pa & 0xFFF));
+    MmUnmapIoSpace(mapped, AEGIS_PAGE_SIZE);
+    return value;
+}
+
+/* Four-level walk: PML4 -> PDPT -> PD -> PT; return final PTE (or PDE for 2MB page). Returns 0 if not present. */
+static ULONG64 AegisPteWalk(ULONG64 Pml4Pa, ULONG_PTR Va)
+{
+    ULONG64 e1, e2, e3, e4;
+    ULONG64 pdpt_pa, pd_pa, pt_pa;
+
+    if (Pml4Pa == 0 || (Va > AEGIS_USER_VA_MAX)) return 0;
+
+    e1 = AegisReadPhysical(Pml4Pa + AEGIS_VA_PML4_I(Va) * 8);
+    if (!(e1 & AEGIS_PTE_PRESENT)) return 0;
+    pdpt_pa = e1 & AEGIS_PFN_MASK;
+
+    e2 = AegisReadPhysical(pdpt_pa + AEGIS_VA_PDPT_I(Va) * 8);
+    if (!(e2 & AEGIS_PTE_PRESENT)) return 0;
+    pd_pa = e2 & AEGIS_PFN_MASK;
+
+    e3 = AegisReadPhysical(pd_pa + AEGIS_VA_PD_I(Va) * 8);
+    if (!(e3 & AEGIS_PTE_PRESENT)) return 0;
+    if (e3 & AEGIS_PDE_PS)
+        return e3;  /* 2MB page: PDE is the “PTE” for NX check */
+    pt_pa = e3 & AEGIS_PFN_MASK;
+
+    e4 = AegisReadPhysical(pt_pa + AEGIS_VA_PT_I(Va) * 8);
+    return e4;
+}
+
+#define AEGIS_VAD_EXEC_MASK  (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
+
+// -----------------------------------------------
+// Phase 4: VAD scan + PTE walk – unbacked RWX and PTE-VAD discrepancy (hidden exec)
 // -----------------------------------------------
 static NTSTATUS AegisScanProcessVad(_In_ ULONG Pid, _Out_ PAEGIS_VAD_SCAN_OUTPUT Output)
 {
@@ -452,6 +524,9 @@ static NTSTATUS AegisScanProcessVad(_In_ ULONG Pid, _Out_ PAEGIS_VAD_SCAN_OUTPUT
     MEMORY_BASIC_INFORMATION mbi;
     SIZE_T retLen;
     ULONG count = 0;
+    ULONG discCount = 0;
+    PEPROCESS processObject = NULL;
+    ULONG64 cr3 = 0;
 
     if (Output == NULL) return STATUS_INVALID_PARAMETER;
     RtlZeroMemory(Output, sizeof(AEGIS_VAD_SCAN_OUTPUT));
@@ -464,6 +539,12 @@ static NTSTATUS AegisScanProcessVad(_In_ ULONG Pid, _Out_ PAEGIS_VAD_SCAN_OUTPUT
     if (!NT_SUCCESS(status)) {
         Output->StatusCode = (ULONG)status;
         return status;
+    }
+
+    status = ObReferenceObjectByHandle(processHandle, PROCESS_QUERY_INFORMATION, PsProcessType, KernelMode, (PVOID*)&processObject, NULL);
+    if (NT_SUCCESS(status) && processObject != NULL) {
+        cr3 = AegisGetProcessCr3(processObject);
+        ObDereferenceObject(processObject);
     }
 
     for (;;) {
@@ -482,7 +563,6 @@ static NTSTATUS AegisScanProcessVad(_In_ ULONG Pid, _Out_ PAEGIS_VAD_SCAN_OUTPUT
         if (mbi.State == MEM_COMMIT &&
             mbi.Protect == PAGE_EXECUTE_READWRITE &&
             mbi.Type != MEM_IMAGE) {
-            /* Unbacked RWX – typical manual map / shellcode injection */
             if (count < AEGIS_MAX_VAD_SCAN_ENTRIES) {
                 Output->Entries[count].BaseAddress = (ULONG_PTR)mbi.BaseAddress;
                 Output->Entries[count].RegionSize = mbi.RegionSize;
@@ -494,14 +574,30 @@ static NTSTATUS AegisScanProcessVad(_In_ ULONG Pid, _Out_ PAEGIS_VAD_SCAN_OUTPUT
                 Pid, mbi.BaseAddress, mbi.RegionSize));
         }
 
+        /* PTE-VAD discrepancy: VAD says non-executable but PTE has NX clear (possible PTE tampering) */
+        if (cr3 != 0 && mbi.State == MEM_COMMIT && discCount < AEGIS_MAX_PTE_DISCREPANCY) {
+            if ((mbi.Protect & AEGIS_VAD_EXEC_MASK) == 0) {
+                ULONG64 pte = AegisPteWalk(cr3, (ULONG_PTR)mbi.BaseAddress);
+                if (pte != 0 && (pte & AEGIS_PTE_NX) == 0) {
+                    Output->Discrepancies[discCount].Va = (ULONG_PTR)mbi.BaseAddress;
+                    Output->Discrepancies[discCount].VadProtect = mbi.Protect;
+                    Output->Discrepancies[discCount].PteValue = pte;
+                    discCount++;
+                    AegisDbgPrint(("[Aegis] PTE-VAD discrepancy PID %u: VA %p VAD protect 0x%X PTE 0x%llX (NX clear)\n",
+                        Pid, mbi.BaseAddress, mbi.Protect, pte));
+                }
+            }
+        }
+
         baseAddress = (PVOID)((ULONG_PTR)mbi.BaseAddress + mbi.RegionSize);
-        if ((ULONG_PTR)baseAddress < (ULONG_PTR)mbi.BaseAddress || (ULONG_PTR)baseAddress > 0x7FFFFFFFFFFFULL)
+        if ((ULONG_PTR)baseAddress < (ULONG_PTR)mbi.BaseAddress || (ULONG_PTR)baseAddress > AEGIS_USER_VA_MAX)
             break;
     }
 
     ZwClose(processHandle);
     Output->StatusCode = 0;
     Output->Count = count;
+    Output->DiscrepancyCount = discCount;
     return STATUS_SUCCESS;
 }
 

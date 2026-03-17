@@ -65,10 +65,20 @@ typedef struct _AEGIS_VAD_ENTRY {
     ULONG     Type;        // MEM_PRIVATE, MEM_MAPPED, MEM_IMAGE
 } AEGIS_VAD_ENTRY, *PAEGIS_VAD_ENTRY;
 
+// PTE-VAD discrepancy: one record (VAD said non-executable, but PTE allows execute)
+#define AEGIS_MAX_PTE_DISCREPANCY  16
+typedef struct _AEGIS_PTE_DISCREPANCY {
+    ULONG_PTR Va;        // virtual address of the page
+    ULONG     VadProtect; // protection from ZwQueryVirtualMemory
+    ULONG64   PteValue;   // raw PTE from page table walk
+} AEGIS_PTE_DISCREPANCY, *PAEGIS_PTE_DISCREPANCY;
+
 typedef struct _AEGIS_VAD_SCAN_OUTPUT {
-    ULONG           StatusCode;   // 0 = success
-    ULONG           Count;       // number of entries in Entries[]
-    AEGIS_VAD_ENTRY Entries[AEGIS_MAX_VAD_SCAN_ENTRIES];
+    ULONG                 StatusCode;   // 0 = success
+    ULONG                 Count;       // number of entries in Entries[]
+    ULONG                 DiscrepancyCount;  // PTE vs VAD mismatch (VAD says no-exec, PTE has NX clear)
+    AEGIS_VAD_ENTRY       Entries[AEGIS_MAX_VAD_SCAN_ENTRIES];
+    AEGIS_PTE_DISCREPANCY Discrepancies[AEGIS_MAX_PTE_DISCREPANCY];
 } AEGIS_VAD_SCAN_OUTPUT, *PAEGIS_VAD_SCAN_OUTPUT;
 
 #endif

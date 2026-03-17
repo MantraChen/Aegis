@@ -46,37 +46,22 @@ Such changes are **hard to detect** from another kernel driver because:
 - The layout and semantics of PTEs (and sometimes table formats) can change with OS versions and with **VBS/HVCI** (e.g. with **Kernel VA Shadowing** and **second-level paging**).
 - **PatchGuard** restricts many kernel modifications; a rootkit that tampers with critical structures risks detection or crash.
 
-So in practice, **detecting** “someone modified the game’s page tables” is **advanced**: it usually involves either a **trusted reference** (e.g. expected PTE attributes per VA range) or lower-level components (e.g. hypervisor or VBS-based integrity). This project does **not** implement full PTE-walk or PTE-integrity checks; Phase 4 Task 1 uses **VAD-style scanning** (virtual memory query API) instead.
+So in practice, **detecting** “someone modified the game’s page tables” is **advanced**: it usually involves either a **trusted reference** (e.g. expected PTE attributes per VA range) or lower-level components (e.g. hypervisor or VBS-based integrity).
 
----
+## 4. Implementation in Project Aegis (PTE walk + discrepancy)
 
-## 4. Educational use of CR3 in the driver (optional)
+The driver **implements** the following (see `driver.c`):
 
-If you want to **see** the current process’s CR3 from the driver (e.g. when attached to the game process), you can use the following **concept** (do not rely on this for security; it is for understanding):
+1. **CR3 for an arbitrary process**  
+   - Use **ObReferenceObjectByHandle** on the process handle to get **PEPROCESS**, then **KeStackAttachProcess** and **`__readcr3()`** to read the PML4 physical base. Mask to 4-level: `cr3 & 0x000FFFFFFFFFF000`.
 
-- While running in the **context of the target process** (e.g. after **KeStackAttachProcess**), **CR3** holds that process’s directory table base. On x64 you can read it with a compiler intrinsic or inline asm (e.g. `__readcr3()` in MSVC). The value is a **physical address** of the PML4 table.
-- You must be at the right IRQL and in a safe context (e.g. not in an arbitrary thread that might not have the process’s CR3 loaded). Attaching to the target process and then reading CR3 is the typical approach.
+2. **Physical read**  
+   - **MmMapIoSpace**(physical page, PAGE_SIZE, MmNonCached) to get a kernel VA, read the 8-byte table entry at the correct offset, then **MmUnmapIoSpace**.
 
-Example **conceptual** snippet (no guarantees; use only in a test environment):
+3. **Four-level walk (PML4 → PDPT → PD → PT)**  
+   - For a user VA, compute indices from bits 39–47, 30–38, 21–29, 12–20. At each level read the entry; if Present=0, abort. If at PD level the **PS (Page Size)** bit is set, treat the PDE as a 2MB page and use it for the NX check. Otherwise continue to PT and read the final PTE.
 
-```c
-// Conceptual only – attach to process, then read CR3 for the current logical processor.
-// The value is the PML4 physical address for that process.
-void ExampleReadProcessCr3(PEPROCESS Process)
-{
-    KAPC_STATE apcState;
-    KeStackAttachProcess(Process, &apcState);
-    // Now we are “in” the target process; CR3 holds its directory table base.
-    // ULONG_PTR cr3 = __readcr3();  // PML4 physical address (implementation-defined)
-    KeUnstackDetachProcess(&apcState);
-}
-```
+4. **PTE–VAD discrepancy**  
+   - For each **committed** region from **ZwQueryVirtualMemory**, if the **VAD protection** says non-executable (no execute bits) but the **PTE** has **NX bit clear** (page is executable), record a **discrepancy**. This indicates possible PTE tampering (e.g. NX stripped to run shellcode). The scan output includes **DiscrepancyCount** and an array of **Discrepancies** (VA, VadProtect, PteValue).
 
-Full **VA → PA** translation would require:
-
-1. Getting the **physical address** of each level (PML4, PDPT, PD, PT) by reading the current table and using the next-level physical frame number.
-2. Mapping physical pages (e.g. **MmMapIoSpace**) if you need to read them from a driver that is not currently using that CR3.
-3. Handling **large pages** (2 MB / 1 GB) where the walk stops early.
-4. Interpreting **PTE** bits (R/W, U/S, NX, etc.) according to the OS and CPU manual.
-
-This is left as an optional, advanced exercise. For Phase 4, the **VAD-style scan** (Task 1) provides a practical way to detect unbacked RWX regions (e.g. manual map) without walking page tables.
+**Caveats**: Behaviour with **VBS/HVCI** or **5-level paging** may differ. Use in a test (e.g. VM) environment.
