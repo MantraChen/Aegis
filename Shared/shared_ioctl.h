@@ -39,6 +39,7 @@ typedef unsigned long ULONG;
 #define IOCTL_AEGIS_SCAN_VAD      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_AEGIS_ADD_RANGE    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_AEGIS_REMOVE_RANGE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_AEGIS_SET_POLICY   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // -----------------------------------------------
 // Input: protect / unprotect by PID
@@ -91,5 +92,28 @@ typedef struct _AEGIS_VAD_SCAN_OUTPUT {
     AEGIS_VAD_ENTRY       Entries[AEGIS_MAX_VAD_SCAN_ENTRIES];
     AEGIS_PTE_DISCREPANCY Discrepancies[AEGIS_MAX_PTE_DISCREPANCY];
 } AEGIS_VAD_SCAN_OUTPUT, *PAEGIS_VAD_SCAN_OUTPUT;
+
+// -----------------------------------------------
+// Dynamic policy (Phase 5): blacklist/whitelist from Ring 3 (no encryption in this version)
+// Layout must match config.h limits (AEGIS_MAX_BLACKLIST_NAMES, AEGIS_MAX_WHITELIST_NAMES, AEGIS_MAX_BLACKLIST_DLL).
+// Optional: layer HMAC/signature verification on top for production.
+// -----------------------------------------------
+#define AEGIS_POLICY_MAX_BLACKLIST   16
+#define AEGIS_POLICY_MAX_WHITELIST   24
+#define AEGIS_POLICY_MAX_DLL_BLACK   32
+#define AEGIS_POLICY_IMAGE_LEN       260   /* WCHAR count for process/DLL names */
+#define AEGIS_POLICY_WHITELIST_LEN   16    /* CHAR count for PsGetProcessImageFileName (often 15) */
+
+typedef struct _AEGIS_POLICY_INPUT {
+    ULONG ProcessBlacklistCount;
+    ULONG ProcessWhitelistCount;
+    ULONG DllBlacklistCount;
+    /* Process blacklist: Unicode names to block from starting (process notify) */
+    WCHAR ProcessBlacklist[AEGIS_POLICY_MAX_BLACKLIST][AEGIS_POLICY_IMAGE_LEN];
+    /* Process whitelist: ASCII names allowed full handle access to protected process/thread */
+    CHAR  ProcessWhitelist[AEGIS_POLICY_MAX_WHITELIST][AEGIS_POLICY_WHITELIST_LEN];
+    /* DLL blacklist: Unicode names to treat as blacklisted in LoadImageNotify (Bloom + exact match) */
+    WCHAR DllBlacklist[AEGIS_POLICY_MAX_DLL_BLACK][AEGIS_POLICY_IMAGE_LEN];
+} AEGIS_POLICY_INPUT, *PAEGIS_POLICY_INPUT;
 
 #endif

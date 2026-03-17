@@ -7,6 +7,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #ifdef _WIN32
 
@@ -42,8 +43,39 @@ static void PrintUsage(const char* prog)
     printf("  %s scan <PID>      - Scan process for unbacked RWX regions (Phase 4)\n", prog);
     printf("  %s addrange <PID> <Low_hex> <High_hex> - Add protected memory range [Low, High) for PID\n", prog);
     printf("  %s removerange <PID> <Low_hex> <High_hex> - Remove protected memory range for PID\n", prog);
+    printf("  %s setpolicy       - Push default blacklist/whitelist/DLL policy to driver (dynamic policy)\n", prog);
     printf("\nExample: %s protect 1234\n", prog);
     printf("Example: %s addrange 1234 0x140000000 0x140010000\n", prog);
+}
+
+/* Default policy (must match driver defaults) for setpolicy command */
+static void FillDefaultPolicy(PAEGIS_POLICY_INPUT p)
+{
+    static const wchar_t* blacklist[] = {
+        L"cheatengine-x86_64.exe", L"cheatengine-i386.exe", L"Cheat Engine.exe",
+        L"x64dbg.exe", L"x32dbg.exe", L"ollydbg.exe"
+    };
+    static const char* whitelist[] = {
+        "System", "csrss.exe", "services.exe", "wininit.exe", "lsass.exe",
+        "svchost.exe", "AegisClient.exe", "GameClient.exe", "TestProtected.exe"
+    };
+    static const wchar_t* dllBlack[] = {
+        L"cheat.dll", L"inject.dll", L"hook.dll", L"speedhack.dll", L"gamehack.dll", L"bypass.dll"
+    };
+    ULONG i;
+    ZeroMemory(p, sizeof(AEGIS_POLICY_INPUT));
+    p->ProcessBlacklistCount = (ULONG)(sizeof(blacklist) / sizeof(blacklist[0]));
+    if (p->ProcessBlacklistCount > AEGIS_POLICY_MAX_BLACKLIST) p->ProcessBlacklistCount = AEGIS_POLICY_MAX_BLACKLIST;
+    for (i = 0; i < p->ProcessBlacklistCount; i++)
+        wcscpy_s(p->ProcessBlacklist[i], AEGIS_POLICY_IMAGE_LEN, blacklist[i]);
+    p->ProcessWhitelistCount = (ULONG)(sizeof(whitelist) / sizeof(whitelist[0]));
+    if (p->ProcessWhitelistCount > AEGIS_POLICY_MAX_WHITELIST) p->ProcessWhitelistCount = AEGIS_POLICY_MAX_WHITELIST;
+    for (i = 0; i < p->ProcessWhitelistCount; i++)
+        strcpy_s(p->ProcessWhitelist[i], AEGIS_POLICY_WHITELIST_LEN, whitelist[i]);
+    p->DllBlacklistCount = (ULONG)(sizeof(dllBlack) / sizeof(dllBlack[0]));
+    if (p->DllBlacklistCount > AEGIS_POLICY_MAX_DLL_BLACK) p->DllBlacklistCount = AEGIS_POLICY_MAX_DLL_BLACK;
+    for (i = 0; i < p->DllBlacklistCount; i++)
+        wcscpy_s(p->DllBlacklist[i], AEGIS_POLICY_IMAGE_LEN, dllBlack[i]);
 }
 
 int main(int argc, char** argv)
@@ -245,6 +277,26 @@ int main(int argc, char** argv)
             printf("OK: removed range [%p, %p) for PID %u\n", (void*)rangeIn.Low, (void*)rangeIn.High, rangeIn.Pid);
         } else {
             printf("Failed: removerange (status 0x%X, GetLastError %lu)\n", out.StatusCode, GetLastError());
+        }
+    } else if (_stricmp(argv[1], "setpolicy") == 0) {
+        AEGIS_POLICY_INPUT policy;
+        FillDefaultPolicy(&policy);
+        ZeroMemory(&out, sizeof(out));
+        ok = DeviceIoControl(
+            hDev,
+            IOCTL_AEGIS_SET_POLICY,
+            &policy,
+            sizeof(policy),
+            &out,
+            sizeof(out),
+            &bytesReturned,
+            NULL
+        );
+        if (ok && out.StatusCode == 0) {
+            printf("OK: policy set (blacklist %u, whitelist %u, DLL blacklist %u)\n",
+                policy.ProcessBlacklistCount, policy.ProcessWhitelistCount, policy.DllBlacklistCount);
+        } else {
+            printf("Failed: setpolicy (status 0x%X, GetLastError %lu)\n", out.StatusCode, GetLastError());
         }
     } else {
         PrintUsage(argv[0]);

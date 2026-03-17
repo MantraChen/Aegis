@@ -166,18 +166,18 @@ Cheats often use `OpenProcess` with `PROCESS_VM_READ` (or `PROCESS_ALL_ACCESS`) 
 - **Process**: Blacklist block + protected-process creation log.
 - **Thread**: Remote threads in protected processes are terminated.
 - **Image**: All image loads into protected processes are logged.
-- **Ob**: Process handle create/duplicate intercepted; non-whitelisted openers get query-only handle.
+- **Ob (process + thread)**: Process and **thread** handle create/duplicate intercepted. Non-whitelisted openers of a **protected process** get **PROCESS_QUERY_LIMITED_INFORMATION** only; non-whitelisted openers of a **thread belonging to a protected process** get **THREAD_QUERY_LIMITED_INFORMATION** only (blocks **THREAD_SET_CONTEXT**, **THREAD_SUSPEND_RESUME**, APC injection, etc.).
 - **VAD scan**: `IOCTL_AEGIS_SCAN_VAD` enumerates VM via `ZwQueryVirtualMemory` and reports **unbacked RWX** regions (manual map heuristic). **PTE walk**: the driver reads the target process **CR3** (via **KeStackAttachProcess** + **`__readcr3()`**), then performs a **four-level page table walk** (PML4→PDPT→PD→PT) using **MmMapIoSpace** to read physical table entries. For each committed region, if **VAD says non-executable** but the **PTE has NX clear**, a **PTE–VAD discrepancy** is recorded (possible PTE tampering). The scan output includes **DiscrepancyCount** and **Discrepancies[]** (VA, VadProtect, PteValue).
 - **Memory range spatial index**: An **interval tree** per process stores protected address ranges `[Low, High)` with **O(log N)** point-in-range query. Use `AegisIsAddressInProtectedRange(Pid, Address)` in future memory read/write interception or hidden scans. **IOCTLs**: `IOCTL_AEGIS_ADD_RANGE` / `IOCTL_AEGIS_REMOVE_RANGE` (input: Pid, Low, High). **Client**: `addrange <PID> <Low_hex> <High_hex>`, `removerange <PID> <Low_hex> <High_hex>`.
-- **Bloom filter**: A **succinct probabilistic** set (~128 bytes, 1024 bits, 7 hashes) holds hashes of **blacklisted DLL names** at init. In **LoadImageNotify** we do an **O(1)** Bloom query on the loaded image filename; on "maybe present" we confirm with an exact blacklist check to avoid false positives. This avoids linear scan over a large DLL blacklist on every load. Optional extension: a second Bloom for **memory signatures** (hash of first N bytes of RWX regions) can be used during VAD scan for O(1) fingerprint matching.
+- **Bloom filter**: A **succinct probabilistic** set (~128 bytes, 1024 bits, 7 hashes) holds hashes of **blacklisted DLL names** (from runtime policy). In **LoadImageNotify** we do an **O(1)** Bloom query on the loaded image filename; on "maybe present" we confirm with an exact blacklist check to avoid false positives.
+- **Dynamic policy**: Blacklist/whitelist and DLL blacklist are no longer hardcoded only. At load the driver initializes from built-in defaults; **IOCTL_AEGIS_SET_POLICY** accepts an **AEGIS_POLICY_INPUT** (process blacklist, process whitelist, DLL blacklist) from Ring 3 and updates the in-kernel policy; the Bloom filter is rebuilt when the DLL list changes. **Client**: `setpolicy` pushes the default policy (same as driver defaults). Optional: layer HMAC/signature verification on the policy buffer for production.
 
 ---
 
 ## Possible extensions
 
-- **Thread handles**: Register Ob callbacks for `PsThreadType` to restrict thread handle rights (e.g. block `THREAD_SET_CONTEXT` from untrusted processes).
 - **Image load**: Block specific DLLs (e.g. unsigned) loading into protected process (e.g. via CI or custom logic).
-- **Dynamic lists**: Add/remove protected or whitelist names/PIDs via registry or IOCTL.
+- **Policy encryption**: Sign or encrypt the policy buffer from Ring 3 so only a trusted service can update the driver’s blacklist/whitelist.
 
 ---
 

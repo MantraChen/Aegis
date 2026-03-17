@@ -32,6 +32,11 @@
 #define AEGIS_DEVICE_NAME   L"\\Device\\ProjectAegis"
 #define AEGIS_LINK_NAME     L"\\DosDevices\\ProjectAegis"
 
+/* Thread access rights for stripping (avoid THREAD_SET_CONTEXT / THREAD_SUSPEND_RESUME / APC injection) */
+#ifndef THREAD_QUERY_LIMITED_INFORMATION
+#define THREAD_QUERY_LIMITED_INFORMATION  (0x0800)
+#endif
+
 // -----------------------------------------------
 // Default protected process name list (matches extern in config.h)
 // -----------------------------------------------
@@ -83,6 +88,15 @@ const wchar_t* AegisBlacklistDllNames[] = {
     L"bypass.dll",
 };
 const ULONG AegisBlacklistDllCount = sizeof(AegisBlacklistDllNames) / sizeof(AegisBlacklistDllNames[0]);
+
+// -----------------------------------------------
+// Runtime policy (Phase 5): writable copy, init from defaults, updatable via IOCTL_AEGIS_SET_POLICY
+// -----------------------------------------------
+static AEGIS_POLICY_INPUT g_RuntimePolicy;
+static KSPIN_LOCK g_PolicyLock;
+
+static void AegisPolicyInitFromDefaults(void);
+static void AegisPolicyRebuildBloom(void);
 
 // -----------------------------------------------
 // Bloom filter – succinct probabilistic set; ~128 bytes, O(k) query/add (k = 7)
@@ -147,18 +161,81 @@ static void AegisBloomReset(void)
     RtlZeroMemory(g_BloomFilter, sizeof(g_BloomFilter));
 }
 
-/* Exact match (case-insensitive) against blacklist – used after Bloom filter hit to avoid FP. */
+/* Add wide string to Bloom (length in bytes, up to first null or maxChars). */
+static void AegisBloomAddWideString(const WCHAR* Buf, ULONG MaxChars)
+{
+    ULONG len = 0;
+    while (len < MaxChars && Buf[len] != L'\0') len++;
+    if (len > 0)
+        AegisBloomAdd((const UCHAR*)Buf, len * sizeof(WCHAR));
+}
+
+/* Exact match (case-insensitive) against runtime DLL blacklist – used after Bloom filter hit. */
 static BOOLEAN AegisIsDllBlacklisted(PCUNICODE_STRING DllName)
 {
     ULONG i;
+    KIRQL oldIrql;
+    BOOLEAN found = FALSE;
+    UNICODE_STRING u;
+
     if (DllName == NULL || DllName->Buffer == NULL) return FALSE;
-    for (i = 0; i < AegisBlacklistDllCount; i++) {
-        UNICODE_STRING u;
-        RtlInitUnicodeString(&u, AegisBlacklistDllNames[i]);
-        if (RtlCompareUnicodeString(DllName, &u, TRUE) == 0)
-            return TRUE;
+    KeAcquireSpinLock(&g_PolicyLock, &oldIrql);
+    for (i = 0; i < g_RuntimePolicy.DllBlacklistCount && i < AEGIS_POLICY_MAX_DLL_BLACK; i++) {
+        RtlInitUnicodeString(&u, g_RuntimePolicy.DllBlacklist[i]);
+        if (u.Buffer != NULL && RtlCompareUnicodeString(DllName, &u, TRUE) == 0) {
+            found = TRUE;
+            break;
+        }
     }
-    return FALSE;
+    KeReleaseSpinLock(&g_PolicyLock, oldIrql);
+    return found;
+}
+
+static ULONG AegisWideLen(const WCHAR* s, ULONG max)
+{
+    ULONG i = 0;
+    while (i < max && s[i] != L'\0') i++;
+    return i;
+}
+static ULONG AegisAnsiLen(const char* s, ULONG max)
+{
+    ULONG i = 0;
+    while (i < max && s[i] != '\0') i++;
+    return i;
+}
+
+static void AegisPolicyInitFromDefaults(void)
+{
+    ULONG i;
+    ULONG len;
+    RtlZeroMemory(&g_RuntimePolicy, sizeof(g_RuntimePolicy));
+    g_RuntimePolicy.ProcessBlacklistCount = (AegisBlacklistProcessCount <= AEGIS_POLICY_MAX_BLACKLIST)
+        ? (ULONG)AegisBlacklistProcessCount : AEGIS_POLICY_MAX_BLACKLIST;
+    for (i = 0; i < g_RuntimePolicy.ProcessBlacklistCount; i++) {
+        len = AegisWideLen(AegisBlacklistProcessNames[i], AEGIS_POLICY_IMAGE_LEN - 1) + 1;
+        RtlCopyMemory(g_RuntimePolicy.ProcessBlacklist[i], AegisBlacklistProcessNames[i], len * sizeof(WCHAR));
+    }
+    g_RuntimePolicy.ProcessWhitelistCount = (AegisWhitelistProcessCount <= AEGIS_POLICY_MAX_WHITELIST)
+        ? (ULONG)AegisWhitelistProcessCount : AEGIS_POLICY_MAX_WHITELIST;
+    for (i = 0; i < g_RuntimePolicy.ProcessWhitelistCount; i++) {
+        len = AegisAnsiLen(AegisWhitelistProcessNames[i], AEGIS_POLICY_WHITELIST_LEN - 1) + 1;
+        RtlCopyMemory(g_RuntimePolicy.ProcessWhitelist[i], AegisWhitelistProcessNames[i], len);
+    }
+    g_RuntimePolicy.DllBlacklistCount = (AegisBlacklistDllCount <= AEGIS_POLICY_MAX_DLL_BLACK)
+        ? (ULONG)AegisBlacklistDllCount : AEGIS_POLICY_MAX_DLL_BLACK;
+    for (i = 0; i < g_RuntimePolicy.DllBlacklistCount; i++) {
+        len = AegisWideLen(AegisBlacklistDllNames[i], AEGIS_POLICY_IMAGE_LEN - 1) + 1;
+        RtlCopyMemory(g_RuntimePolicy.DllBlacklist[i], AegisBlacklistDllNames[i], len * sizeof(WCHAR));
+    }
+    AegisPolicyRebuildBloom();
+}
+
+static void AegisPolicyRebuildBloom(void)
+{
+    ULONG i;
+    AegisBloomReset();
+    for (i = 0; i < g_RuntimePolicy.DllBlacklistCount && i < AEGIS_POLICY_MAX_DLL_BLACK; i++)
+        AegisBloomAddWideString(g_RuntimePolicy.DllBlacklist[i], AEGIS_POLICY_IMAGE_LEN);
 }
 
 // -----------------------------------------------
@@ -518,6 +595,30 @@ static NTSTATUS AegisDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In
         AegisDbgPrint(("[Aegis] IOCTL remove range PID %u [%p, %p)\n", in->Pid, (void*)in->Low, (void*)in->High));
         break;
     }
+    case IOCTL_AEGIS_SET_POLICY: {
+        PAEGIS_POLICY_INPUT in = (PAEGIS_POLICY_INPUT)inBuf;
+        KIRQL oldIrql;
+        if (inSize < sizeof(AEGIS_POLICY_INPUT) || in == NULL) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            outData.StatusCode = (ULONG)status;
+            break;
+        }
+        if (in->ProcessBlacklistCount > AEGIS_POLICY_MAX_BLACKLIST ||
+            in->ProcessWhitelistCount > AEGIS_POLICY_MAX_WHITELIST ||
+            in->DllBlacklistCount > AEGIS_POLICY_MAX_DLL_BLACK) {
+            status = STATUS_INVALID_PARAMETER;
+            outData.StatusCode = (ULONG)status;
+            break;
+        }
+        KeAcquireSpinLock(&g_PolicyLock, &oldIrql);
+        RtlCopyMemory(&g_RuntimePolicy, in, sizeof(AEGIS_POLICY_INPUT));
+        AegisPolicyRebuildBloom();
+        KeReleaseSpinLock(&g_PolicyLock, oldIrql);
+        outData.StatusCode = 0;
+        AegisDbgPrint(("[Aegis] IOCTL SET_POLICY: blacklist %u whitelist %u dll %u\n",
+            g_RuntimePolicy.ProcessBlacklistCount, g_RuntimePolicy.ProcessWhitelistCount, g_RuntimePolicy.DllBlacklistCount));
+        break;
+    }
     default:
         status = STATUS_INVALID_DEVICE_REQUEST;
         outData.StatusCode = (ULONG)status;
@@ -837,7 +938,6 @@ static NTSTATUS AegisScanProcessVad(_In_ ULONG Pid, _Out_ PAEGIS_VAD_SCAN_OUTPUT
 NTSTATUS AegisProtectionInitialize(void)
 {
     ULONG i;
-    UNICODE_STRING u;
 
     InterlockedExchange(&g_ProtectedPidCount, 0);
     for (i = 0; i < AEGIS_MAX_PROTECTED_PIDS; i++)
@@ -846,11 +946,8 @@ NTSTATUS AegisProtectionInitialize(void)
     KeInitializeSpinLock(&g_RangeTreeLock);
     RtlZeroMemory(g_RangeContexts, sizeof(g_RangeContexts));
 
-    AegisBloomReset();
-    for (i = 0; i < AegisBlacklistDllCount; i++) {
-        RtlInitUnicodeString(&u, AegisBlacklistDllNames[i]);
-        AegisBloomAdd((PUCHAR)u.Buffer, u.Length);
-    }
+    KeInitializeSpinLock(&g_PolicyLock);
+    AegisPolicyInitFromDefaults();
 
     return STATUS_SUCCESS;
 }
@@ -912,7 +1009,7 @@ NTSTATUS AegisRegisterCallbacks(void)
     NTSTATUS status;
     UNICODE_STRING altitude;
     OB_CALLBACK_REGISTRATION obReg;
-    OB_OPERATION_REGISTRATION obOpReg[1];
+    OB_OPERATION_REGISTRATION obOpReg[2];
 
     status = PsSetCreateThreadNotifyRoutine(AegisThreadNotifyCallback);
     if (!NT_SUCCESS(status)) {
@@ -930,14 +1027,18 @@ NTSTATUS AegisRegisterCallbacks(void)
     }
     g_AegisImageNotifyRegistered = TRUE;
 
-    /* Phase 3: ObRegisterCallbacks for process handle create/duplicate */
+    /* Phase 3 + 5: ObRegisterCallbacks for process and thread handle create/duplicate */
     RtlInitUnicodeString(&altitude, L"320000.123");
     obOpReg[0].ObjectType = PsProcessType;
     obOpReg[0].Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
     obOpReg[0].PreOperation = AegisObPreOperationCallback;
     obOpReg[0].PostOperation = NULL;
+    obOpReg[1].ObjectType = PsThreadType;
+    obOpReg[1].Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
+    obOpReg[1].PreOperation = AegisObPreOperationCallback;
+    obOpReg[1].PostOperation = NULL;
     obReg.Version = OB_FLT_REGISTRATION_VERSION;
-    obReg.OperationRegistrationCount = 1;
+    obReg.OperationRegistrationCount = 2;
     obReg.Altitude = altitude;
     obReg.RegistrationContext = NULL;
     obReg.OperationRegistration = obOpReg;
@@ -978,19 +1079,25 @@ static BOOLEAN AegisIsProcessWhitelisted(PEPROCESS Process)
 {
     ULONG i;
     const char* imageName;
+    KIRQL oldIrql;
+    BOOLEAN found = FALSE;
+    ANSI_STRING aCur, aList;
 
     if (Process == NULL) return FALSE;
     imageName = PsGetProcessImageFileName(Process);
     if (imageName == NULL) return FALSE;
 
-    for (i = 0; i < AegisWhitelistProcessCount; i++) {
-        ANSI_STRING aCur, aList;
-        RtlInitAnsiString(&aCur, imageName);
-        RtlInitAnsiString(&aList, (PCHAR)AegisWhitelistProcessNames[i]);
-        if (RtlCompareString(&aCur, &aList, TRUE) == 0)
-            return TRUE;
+    RtlInitAnsiString(&aCur, imageName);
+    KeAcquireSpinLock(&g_PolicyLock, &oldIrql);
+    for (i = 0; i < g_RuntimePolicy.ProcessWhitelistCount && i < AEGIS_POLICY_MAX_WHITELIST; i++) {
+        RtlInitAnsiString(&aList, g_RuntimePolicy.ProcessWhitelist[i]);
+        if (aList.Buffer != NULL && RtlCompareString(&aCur, &aList, TRUE) == 0) {
+            found = TRUE;
+            break;
+        }
     }
-    return FALSE;
+    KeReleaseSpinLock(&g_PolicyLock, oldIrql);
+    return found;
 }
 
 static OB_PREOP_CALLBACK_STATUS AegisObPreOperationCallback(
@@ -999,6 +1106,8 @@ static OB_PREOP_CALLBACK_STATUS AegisObPreOperationCallback(
 )
 {
     PEPROCESS targetProcess;
+    PEPROCESS ownerProcess;
+    PETHREAD targetThread;
     PEPROCESS creatorProcess;
     PACCESS_MASK pDesiredAccess;
 
@@ -1007,18 +1116,6 @@ static OB_PREOP_CALLBACK_STATUS AegisObPreOperationCallback(
     if (OperationInformation->KernelHandle)
         return OB_PREOP_SUCCESS;
 
-    if (OperationInformation->ObjectType != PsProcessType)
-        return OB_PREOP_SUCCESS;
-
-    targetProcess = (PEPROCESS)OperationInformation->Object;
-    if (!AegisIsProcessProtected(targetProcess))
-        return OB_PREOP_SUCCESS;
-
-    creatorProcess = PsGetCurrentProcess();
-    if (AegisIsProcessWhitelisted(creatorProcess))
-        return OB_PREOP_SUCCESS;
-
-    /* Non-whitelisted process opening/duplicating handle to protected process – strip to query-only */
     if (OperationInformation->Operation == OB_OPERATION_HANDLE_CREATE) {
         pDesiredAccess = &OperationInformation->Parameters->CreateHandleInformation.DesiredAccess;
     } else if (OperationInformation->Operation == OB_OPERATION_HANDLE_DUPLICATE) {
@@ -1027,8 +1124,29 @@ static OB_PREOP_CALLBACK_STATUS AegisObPreOperationCallback(
         return OB_PREOP_SUCCESS;
     }
 
-    *pDesiredAccess = PROCESS_QUERY_LIMITED_INFORMATION;
-    AegisDbgPrint(("[Aegis] Ob: stripped handle access for PID %p -> protected process\n", PsGetCurrentProcessId()));
+    creatorProcess = PsGetCurrentProcess();
+    if (AegisIsProcessWhitelisted(creatorProcess))
+        return OB_PREOP_SUCCESS;
+
+    if (OperationInformation->ObjectType == PsProcessType) {
+        targetProcess = (PEPROCESS)OperationInformation->Object;
+        if (!AegisIsProcessProtected(targetProcess))
+            return OB_PREOP_SUCCESS;
+        *pDesiredAccess = PROCESS_QUERY_LIMITED_INFORMATION;
+        AegisDbgPrint(("[Aegis] Ob: stripped process handle access for PID %p -> protected process\n", PsGetCurrentProcessId()));
+        return OB_PREOP_SUCCESS;
+    }
+
+    if (OperationInformation->ObjectType == PsThreadType) {
+        targetThread = (PETHREAD)OperationInformation->Object;
+        ownerProcess = PsGetThreadProcess(targetThread);
+        if (ownerProcess == NULL || !AegisIsProcessProtected(ownerProcess))
+            return OB_PREOP_SUCCESS;
+        /* Strip to query-only to block THREAD_SET_CONTEXT, THREAD_SUSPEND_RESUME, APC injection, etc. */
+        *pDesiredAccess = THREAD_QUERY_LIMITED_INFORMATION;
+        AegisDbgPrint(("[Aegis] Ob: stripped thread handle access for PID %p -> thread in protected process\n", PsGetCurrentProcessId()));
+        return OB_PREOP_SUCCESS;
+    }
 
     return OB_PREOP_SUCCESS;
 }
@@ -1039,14 +1157,21 @@ static OB_PREOP_CALLBACK_STATUS AegisObPreOperationCallback(
 static BOOLEAN AegisIsProcessBlacklisted(PCUNICODE_STRING ImageName)
 {
     ULONG i;
+    KIRQL oldIrql;
+    BOOLEAN found = FALSE;
+    UNICODE_STRING u;
+
     if (ImageName == NULL || ImageName->Buffer == NULL) return FALSE;
-    for (i = 0; i < AegisBlacklistProcessCount; i++) {
-        UNICODE_STRING u;
-        RtlInitUnicodeString(&u, AegisBlacklistProcessNames[i]);
-        if (RtlCompareUnicodeString(ImageName, &u, TRUE) == 0)
-            return TRUE;
+    KeAcquireSpinLock(&g_PolicyLock, &oldIrql);
+    for (i = 0; i < g_RuntimePolicy.ProcessBlacklistCount && i < AEGIS_POLICY_MAX_BLACKLIST; i++) {
+        RtlInitUnicodeString(&u, g_RuntimePolicy.ProcessBlacklist[i]);
+        if (u.Buffer != NULL && RtlCompareUnicodeString(ImageName, &u, TRUE) == 0) {
+            found = TRUE;
+            break;
+        }
     }
-    return FALSE;
+    KeReleaseSpinLock(&g_PolicyLock, oldIrql);
+    return found;
 }
 
 static void AegisProcessNotifyCallback(
