@@ -21,7 +21,8 @@ Project Aegis/
 ├── Shared/
 │   └── shared_ioctl.h            # IOCTL codes and structs (driver + client)
 ├── docs/
-│   └── Phase1-DualMachineDebug.md # Dual-machine kernel debugging setup
+│   ├── Phase1-DualMachineDebug.md   # Dual-machine kernel debugging setup
+│   └── Phase4-CR3-PageTables.md     # CR3 / page table (optional, Phase 4 Task 2)
 ├── ProjectAegis/                 # Kernel driver (Ring 0)
 │   ├── ProjectAegis.vcxproj
 │   ├── ProjectAegis.inf
@@ -143,13 +144,29 @@ Cheats often use `OpenProcess` with `PROCESS_VM_READ` (or `PROCESS_ALL_ACCESS`) 
 
 ---
 
-## Current implementation (Phase 1 + Phase 2 + Phase 3)
+## Phase 4: Memory protection and hidden-scan (advanced)
 
-- **Driver**: Device, IOCTL, protected PID list, process/thread/image callbacks, **Ob process callbacks**.
+**Task 1 – VAD-style scan (unbacked RWX)**  
+- The driver does **not** walk the internal VAD tree (undocumented); it uses **ZwQueryVirtualMemory** in a loop to enumerate virtual memory regions of a target process (by PID).  
+- It looks for regions that are **committed**, have protection **PAGE_EXECUTE_READWRITE (RWX)**, and **type ≠ MEM_IMAGE** (i.e. not backed by a mapped image file). Such regions are a common signature of **manual map** injection or shellcode.  
+- **IOCTL**: `IOCTL_AEGIS_SCAN_VAD`. Input: PID (`AEGIS_PID_INPUT`). Output: `AEGIS_VAD_SCAN_OUTPUT` (count + array of `AEGIS_VAD_ENTRY`: base, size, protect, type). Suspicious regions are also logged via `DbgPrint`.  
+- The client can send “scan PID” and display the list of suspicious ranges.
+
+**Task 2 – CR3 and page tables (optional / advanced)**  
+- **Documentation**: [docs/Phase4-CR3-PageTables.md](docs/Phase4-CR3-PageTables.md) explains virtual-to-physical translation, CR3, the four-level page walk, and how a rootkit could modify a game’s page table (e.g. clear NX, change R/W).  
+- **Detection** of such modifications from another driver is advanced (OS-version dependent, PTE layout, VBS/HVCI); the doc describes the idea and does **not** implement full PTE-walk or integrity checks.  
+- A short comment in the driver points to the doc; reading CR3 (e.g. after `KeStackAttachProcess`) is left as an optional exercise.
+
+---
+
+## Current implementation (Phase 1 + Phase 2 + Phase 3 + Phase 4)
+
+- **Driver**: Device, IOCTL, protected PID list, process/thread/image callbacks, Ob process callbacks, **VAD-style scan**.
 - **Process**: Blacklist block + protected-process creation log.
 - **Thread**: Remote threads in protected processes are terminated.
 - **Image**: All image loads into protected processes are logged.
-- **Ob**: Process handle create/duplicate are intercepted; non-whitelisted openers of protected process get **query-only** handle (no VM read/write/terminate).
+- **Ob**: Process handle create/duplicate intercepted; non-whitelisted openers get query-only handle.
+- **VAD scan**: `IOCTL_AEGIS_SCAN_VAD` enumerates VM via `ZwQueryVirtualMemory` and reports **unbacked RWX** regions (manual map heuristic). **CR3/page table**: doc only (optional); no PTE walk in code.
 
 ---
 

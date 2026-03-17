@@ -5,9 +5,17 @@
 //
 
 #include <ntddk.h>
+#include <ntifs.h>
 #include "config.h"
 #include "protection.h"
 #include "shared_ioctl.h"
+
+/* Phase 4: VAD-style scan – unbacked RWX detection */
+#define PAGE_EXECUTE_READWRITE  0x40
+#define MEM_IMAGE               0x100000
+
+/* Task 2 (optional): CR3 / page table – see docs/Phase4-CR3-PageTables.md.
+ * To read current process CR3 when attached: KeStackAttachProcess(Process, &apcState); cr3 = __readcr3(); KeUnstackDetachProcess(&apcState). */
 
 #define AEGIS_DEVICE_NAME   L"\\Device\\ProjectAegis"
 #define AEGIS_LINK_NAME     L"\\DosDevices\\ProjectAegis"
@@ -85,6 +93,7 @@ static PVOID g_ObCallbackHandle = NULL;
 
 static BOOLEAN AegisIsProcessBlacklisted(PCUNICODE_STRING ImageName);
 static BOOLEAN AegisIsProcessWhitelisted(PEPROCESS Process);
+static NTSTATUS AegisScanProcessVad(_In_ ULONG Pid, _Out_ PAEGIS_VAD_SCAN_OUTPUT Output);
 static OB_PREOP_CALLBACK_STATUS AegisObPreOperationCallback(
     _In_ PVOID RegistrationContext,
     _Inout_ POB_PRE_OPERATION_INFORMATION OperationInformation
@@ -300,20 +309,99 @@ static NTSTATUS AegisDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In
         RtlCopyMemory(outBuf, &outData, sizeof(outData));
         Irp->IoStatus.Information = sizeof(AEGIS_STATUS_OUTPUT);
         break;
+    case IOCTL_AEGIS_SCAN_VAD: {
+        PAEGIS_PID_INPUT in = (PAEGIS_PID_INPUT)inBuf;
+        PAEGIS_VAD_SCAN_OUTPUT out = (PAEGIS_VAD_SCAN_OUTPUT)outBuf;
+        if (inSize < sizeof(AEGIS_PID_INPUT) || in == NULL || outSize < sizeof(AEGIS_VAD_SCAN_OUTPUT) || out == NULL) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        RtlZeroMemory(out, sizeof(AEGIS_VAD_SCAN_OUTPUT));
+        status = AegisScanProcessVad(in->Pid, out);
+        if (NT_SUCCESS(status))
+            Irp->IoStatus.Information = sizeof(AEGIS_VAD_SCAN_OUTPUT);
+        break;
+    }
     default:
         status = STATUS_INVALID_DEVICE_REQUEST;
         outData.StatusCode = (ULONG)status;
         break;
     }
 
-    if (code != IOCTL_AEGIS_GET_STATUS && outSize >= sizeof(AEGIS_STATUS_OUTPUT))
+    if (code != IOCTL_AEGIS_GET_STATUS && code != IOCTL_AEGIS_SCAN_VAD && outSize >= sizeof(AEGIS_STATUS_OUTPUT)) {
         RtlCopyMemory(outBuf, &outData, sizeof(outData));
-    if (code != IOCTL_AEGIS_GET_STATUS && outSize >= sizeof(AEGIS_STATUS_OUTPUT))
         Irp->IoStatus.Information = sizeof(AEGIS_STATUS_OUTPUT);
+    }
 
     Irp->IoStatus.Status = status;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
     return status;
+}
+
+// -----------------------------------------------
+// Phase 4: VAD-style scan – enumerate VM regions, flag unbacked RWX (manual map heuristic)
+// -----------------------------------------------
+static NTSTATUS AegisScanProcessVad(_In_ ULONG Pid, _Out_ PAEGIS_VAD_SCAN_OUTPUT Output)
+{
+    NTSTATUS status;
+    HANDLE processHandle = NULL;
+    OBJECT_ATTRIBUTES oa;
+    CLIENT_ID cid;
+    PVOID baseAddress = NULL;
+    MEMORY_BASIC_INFORMATION mbi;
+    SIZE_T retLen;
+    ULONG count = 0;
+
+    if (Output == NULL) return STATUS_INVALID_PARAMETER;
+    RtlZeroMemory(Output, sizeof(AEGIS_VAD_SCAN_OUTPUT));
+
+    InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+    cid.UniqueProcess = (HANDLE)(ULONG_PTR)Pid;
+    cid.UniqueThread = NULL;
+
+    status = ZwOpenProcess(&processHandle, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, &oa, &cid);
+    if (!NT_SUCCESS(status)) {
+        Output->StatusCode = (ULONG)status;
+        return status;
+    }
+
+    for (;;) {
+        RtlZeroMemory(&mbi, sizeof(mbi));
+        status = ZwQueryVirtualMemory(
+            processHandle,
+            baseAddress,
+            MemoryBasicInformation,
+            &mbi,
+            sizeof(mbi),
+            &retLen
+        );
+        if (!NT_SUCCESS(status))
+            break;
+
+        if (mbi.State == MEM_COMMIT &&
+            mbi.Protect == PAGE_EXECUTE_READWRITE &&
+            mbi.Type != MEM_IMAGE) {
+            /* Unbacked RWX – typical manual map / shellcode injection */
+            if (count < AEGIS_MAX_VAD_SCAN_ENTRIES) {
+                Output->Entries[count].BaseAddress = (ULONG_PTR)mbi.BaseAddress;
+                Output->Entries[count].RegionSize = mbi.RegionSize;
+                Output->Entries[count].Protect = mbi.Protect;
+                Output->Entries[count].Type = mbi.Type;
+                count++;
+            }
+            AegisDbgPrint(("[Aegis] VAD scan PID %u: suspicious RWX unbacked at %p size %Iu\n",
+                Pid, mbi.BaseAddress, mbi.RegionSize));
+        }
+
+        baseAddress = (PVOID)((ULONG_PTR)mbi.BaseAddress + mbi.RegionSize);
+        if ((ULONG_PTR)baseAddress < (ULONG_PTR)mbi.BaseAddress || (ULONG_PTR)baseAddress > 0x7FFFFFFFFFFFULL)
+            break;
+    }
+
+    ZwClose(processHandle);
+    Output->StatusCode = 0;
+    Output->Count = count;
+    return STATUS_SUCCESS;
 }
 
 // -----------------------------------------------

@@ -39,6 +39,7 @@ static void PrintUsage(const char* prog)
     printf("  %s protect <PID>   - Add PID to protected list\n", prog);
     printf("  %s unprotect <PID> - Remove PID from protected list\n", prog);
     printf("  %s status         - Show protected count and driver status\n", prog);
+    printf("  %s scan <PID>      - Scan process for unbacked RWX regions (Phase 4)\n", prog);
     printf("\nExample: %s protect 1234\n", prog);
 }
 
@@ -136,6 +137,43 @@ int main(int argc, char** argv)
             printf("Driver status: 0x%X, protected PIDs count: %u\n", out.StatusCode, out.ProtectedCount);
         } else {
             printf("DeviceIoControl GET_STATUS failed: %lu\n", GetLastError());
+        }
+    } else if (_stricmp(argv[1], "scan") == 0) {
+        AEGIS_VAD_SCAN_OUTPUT scanOut;
+        ULONG i;
+        if (argc < 3) {
+            PrintUsage(argv[0]);
+            CloseHandle(hDev);
+            return 1;
+        }
+        pidArg = atoi(argv[2]);
+        if (pidArg <= 0) {
+            fprintf(stderr, "Invalid PID: %s\n", argv[2]);
+            CloseHandle(hDev);
+            return 1;
+        }
+        in.Pid = (ULONG)pidArg;
+        ZeroMemory(&scanOut, sizeof(scanOut));
+        ok = DeviceIoControl(
+            hDev,
+            IOCTL_AEGIS_SCAN_VAD,
+            &in,
+            sizeof(in),
+            &scanOut,
+            sizeof(scanOut),
+            &bytesReturned,
+            NULL
+        );
+        if (ok && scanOut.StatusCode == 0) {
+            printf("VAD scan PID %u: %u suspicious (unbacked RWX) region(s)\n", in.Pid, scanOut.Count);
+            for (i = 0; i < scanOut.Count; i++) {
+                printf("  [%u] base %p size 0x%zX protect 0x%X type 0x%X\n",
+                    i, (void*)(ULONG_PTR)scanOut.Entries[i].BaseAddress,
+                    (size_t)scanOut.Entries[i].RegionSize,
+                    scanOut.Entries[i].Protect, scanOut.Entries[i].Type);
+            }
+        } else {
+            printf("VAD scan failed: status 0x%X, GetLastError %lu\n", scanOut.StatusCode, GetLastError());
         }
     } else {
         PrintUsage(argv[0]);
