@@ -168,6 +168,7 @@ Cheats often use `OpenProcess` with `PROCESS_VM_READ` (or `PROCESS_ALL_ACCESS`) 
 - **Image**: All image loads into protected processes are logged.
 - **Ob**: Process handle create/duplicate intercepted; non-whitelisted openers get query-only handle.
 - **VAD scan**: `IOCTL_AEGIS_SCAN_VAD` enumerates VM via `ZwQueryVirtualMemory` and reports **unbacked RWX** regions (manual map heuristic). **CR3/page table**: doc only (optional); no PTE walk in code.
+- **Bloom filter**: A **succinct probabilistic** set (~128 bytes, 1024 bits, 7 hashes) holds hashes of **blacklisted DLL names** at init. In **LoadImageNotify** we do an **O(1)** Bloom query on the loaded image filename; on "maybe present" we confirm with an exact blacklist check to avoid false positives. This avoids linear scan over a large DLL blacklist on every load. Optional extension: a second Bloom for **memory signatures** (hash of first N bytes of RWX regions) can be used during VAD scan for O(1) fingerprint matching.
 
 ---
 

@@ -60,6 +60,96 @@ const char* AegisWhitelistProcessNames[] = {
 const ULONG AegisWhitelistProcessCount = sizeof(AegisWhitelistProcessNames) / sizeof(AegisWhitelistProcessNames[0]);
 
 // -----------------------------------------------
+// Blacklist DLL names – hashed into Bloom filter at init; O(1) check in LoadImageNotify (config.h extern)
+// -----------------------------------------------
+const wchar_t* AegisBlacklistDllNames[] = {
+    L"cheat.dll",
+    L"inject.dll",
+    L"hook.dll",
+    L"speedhack.dll",
+    L"gamehack.dll",
+    L"bypass.dll",
+};
+const ULONG AegisBlacklistDllCount = sizeof(AegisBlacklistDllNames) / sizeof(AegisBlacklistDllNames[0]);
+
+// -----------------------------------------------
+// Bloom filter – succinct probabilistic set; ~128 bytes, O(k) query/add (k = 7)
+// -----------------------------------------------
+#define AEGIS_BLOOM_MASK  (AEGIS_BLOOM_BITS - 1)
+static UCHAR g_BloomFilter[AEGIS_BLOOM_BITS / 8];
+
+static ULONG AegisBloomHash(_In_reads_bytes_(Len) const UCHAR* Data, ULONG Len, ULONG Seed)
+{
+    ULONG h = (Seed != 0) ? Seed : 0x811c9dc5u;  /* FNV-1a offset */
+    ULONG i;
+    for (i = 0; i < Len; i++) {
+        h ^= Data[i];
+        h *= 0x01000193u;  /* FNV prime */
+    }
+    return h;
+}
+
+static void AegisBloomSetBit(ULONG Index)
+{
+    ULONG byteIdx = Index / 8;
+    ULONG bitIdx = Index % 8;
+    if (byteIdx < (AEGIS_BLOOM_BITS / 8))
+        g_BloomFilter[byteIdx] |= (UCHAR)(1u << bitIdx);
+}
+
+static BOOLEAN AegisBloomTestBit(ULONG Index)
+{
+    ULONG byteIdx = Index / 8;
+    ULONG bitIdx = Index % 8;
+    if (byteIdx >= (AEGIS_BLOOM_BITS / 8)) return FALSE;
+    return (g_BloomFilter[byteIdx] & (UCHAR)(1u << bitIdx)) != 0;
+}
+
+static void AegisBloomAdd(_In_reads_bytes_(Len) const UCHAR* Data, ULONG Len)
+{
+    ULONG h1 = AegisBloomHash(Data, Len, 0);
+    ULONG h2 = AegisBloomHash(Data, Len, 0x9e3779b9u);
+    ULONG i;
+    for (i = 0; i < AEGIS_BLOOM_HASHES; i++) {
+        ULONG idx = (h1 + i * h2) & AEGIS_BLOOM_MASK;
+        AegisBloomSetBit(idx);
+    }
+}
+
+/* Returns TRUE if key is *possibly* in the set (may have false positives). */
+static BOOLEAN AegisBloomQuery(_In_reads_bytes_(Len) const UCHAR* Data, ULONG Len)
+{
+    ULONG h1 = AegisBloomHash(Data, Len, 0);
+    ULONG h2 = AegisBloomHash(Data, Len, 0x9e3779b9u);
+    ULONG i;
+    for (i = 0; i < AEGIS_BLOOM_HASHES; i++) {
+        ULONG idx = (h1 + i * h2) & AEGIS_BLOOM_MASK;
+        if (!AegisBloomTestBit(idx))
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static void AegisBloomReset(void)
+{
+    RtlZeroMemory(g_BloomFilter, sizeof(g_BloomFilter));
+}
+
+/* Exact match (case-insensitive) against blacklist – used after Bloom filter hit to avoid FP. */
+static BOOLEAN AegisIsDllBlacklisted(PCUNICODE_STRING DllName)
+{
+    ULONG i;
+    if (DllName == NULL || DllName->Buffer == NULL) return FALSE;
+    for (i = 0; i < AegisBlacklistDllCount; i++) {
+        UNICODE_STRING u;
+        RtlInitUnicodeString(&u, AegisBlacklistDllNames[i]);
+        if (RtlCompareUnicodeString(DllName, &u, TRUE) == 0)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+// -----------------------------------------------
 // PID list (dynamic via IOCTL) – lock-free for read path (Ob/thread/image callbacks)
 // Writers (IOCTL) use InterlockedCompareExchange; readers just read the array (no lock).
 // -----------------------------------------------
@@ -349,6 +439,8 @@ static NTSTATUS AegisDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In
 
 // -----------------------------------------------
 // Phase 4: VAD-style scan – enumerate VM regions, flag unbacked RWX (manual map heuristic)
+// Optional extension: hash first N bytes of each RWX region and query a second Bloom filter
+// of known-bad code signatures for O(1) fingerprint match without linear feature scan.
 // -----------------------------------------------
 static NTSTATUS AegisScanProcessVad(_In_ ULONG Pid, _Out_ PAEGIS_VAD_SCAN_OUTPUT Output)
 {
@@ -419,9 +511,18 @@ static NTSTATUS AegisScanProcessVad(_In_ ULONG Pid, _Out_ PAEGIS_VAD_SCAN_OUTPUT
 NTSTATUS AegisProtectionInitialize(void)
 {
     ULONG i;
+    UNICODE_STRING u;
+
     InterlockedExchange(&g_ProtectedPidCount, 0);
     for (i = 0; i < AEGIS_MAX_PROTECTED_PIDS; i++)
         InterlockedExchange((LONG*)&g_ProtectedPids[i], 0);
+
+    AegisBloomReset();
+    for (i = 0; i < AegisBlacklistDllCount; i++) {
+        RtlInitUnicodeString(&u, AegisBlacklistDllNames[i]);
+        AegisBloomAdd((PUCHAR)u.Buffer, u.Length);
+    }
+
     return STATUS_SUCCESS;
 }
 
@@ -658,7 +759,7 @@ static void AegisThreadNotifyCallback(_In_ HANDLE ProcessId, _In_ HANDLE ThreadI
 }
 
 // -----------------------------------------------
-// Task 3: Load image notify – log DLL loads into protected process
+// Task 3: Load image notify – O(1) Bloom filter hit, then exact blacklist check
 // -----------------------------------------------
 static void AegisLoadImageNotifyCallback(
     _In_opt_ PUNICODE_STRING FullImageName,
@@ -666,11 +767,59 @@ static void AegisLoadImageNotifyCallback(
     _In_ PIMAGE_INFO ImageInfo
 )
 {
+    WCHAR fileBuf[AEGIS_MAX_IMAGE_NAME_LEN];
+    WCHAR fileBufDown[AEGIS_MAX_IMAGE_NAME_LEN];
+    UNICODE_STRING srcStr, destStr;
+    PWCHAR p, last, filenameStart;
+    USHORT filenameLenBytes;
+
     if (FullImageName == NULL || ImageInfo == NULL)
         return;
     if (!AegisIsProcessProtectedByPid(ProcessId))
         return;
-    /* Log any image load (exe or DLL) into protected process; typical injection is DLL. */
+
+    /* Extract last path component (filename) for Bloom query */
+    if (FullImageName->Length == 0 || FullImageName->Buffer == NULL)
+        goto log_only;
+    last = (PWCHAR)((PUCHAR)FullImageName->Buffer + FullImageName->Length) - 1;
+    if (last < FullImageName->Buffer)
+        goto log_only;
+    for (p = last; p >= FullImageName->Buffer; p--) {
+        if (*p == L'\\') {
+            p++;
+            break;
+        }
+    }
+    filenameStart = (p >= FullImageName->Buffer && *p != L'\\') ? p : FullImageName->Buffer;
+    filenameLenBytes = (USHORT)((PUCHAR)(last + 1) - (PUCHAR)filenameStart);
+    if (filenameLenBytes > (AEGIS_MAX_IMAGE_NAME_LEN - 1) * sizeof(WCHAR))
+        filenameLenBytes = (USHORT)((AEGIS_MAX_IMAGE_NAME_LEN - 1) * sizeof(WCHAR));
+
+    RtlZeroMemory(fileBuf, sizeof(fileBuf));
+    RtlCopyMemory(fileBuf, filenameStart, filenameLenBytes);
+    srcStr.Buffer = fileBuf;
+    srcStr.Length = filenameLenBytes;
+    srcStr.MaximumLength = (USHORT)sizeof(fileBuf);
+    destStr.Buffer = fileBufDown;
+    destStr.Length = 0;
+    destStr.MaximumLength = (USHORT)sizeof(fileBufDown);
+    if (RtlDowncaseUnicodeString(&destStr, &srcStr, FALSE) != STATUS_SUCCESS) {
+        destStr.Buffer = fileBuf;
+        destStr.Length = filenameLenBytes;
+    }
+
+    /* O(1) Bloom filter: if definitely not in set, skip blacklist check */
+    if (!AegisBloomQuery((PUCHAR)destStr.Buffer, destStr.Length))
+        goto log_only;
+
+    /* Bloom said "maybe" – confirm with exact blacklist (avoids false positives) */
+    if (AegisIsDllBlacklisted(&destStr)) {
+        AegisDbgPrint(("[Aegis] BLACKLISTED DLL loaded into protected PID %p: %wZ (base %p)\n",
+            ProcessId, FullImageName, ImageInfo->ImageBase));
+        return;
+    }
+
+log_only:
     AegisDbgPrint(("[Aegis] Image loaded into protected PID %p: %wZ (base %p)\n",
         ProcessId, FullImageName, ImageInfo->ImageBase));
 }

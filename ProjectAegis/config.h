@@ -19,6 +19,11 @@ extern "C" {
 #define AEGIS_MAX_BLACKLIST_NAMES  16  // process names to block (e.g. cheat tools)
 #define AEGIS_MAX_WHITELIST_NAMES  24  // process names allowed to open protected process with full access (Phase 3)
 
+// Bloom filter for O(1) DLL / feature matching (succinct probabilistic structure)
+#define AEGIS_BLOOM_BITS           1024   // bit array size (power of 2)
+#define AEGIS_BLOOM_HASHES         7      // number of hash functions (Kirsch–Mitzenmacher)
+#define AEGIS_MAX_BLACKLIST_DLL    32     // max blacklisted DLL names to add to filter
+
 // Default protected names (defined in driver.c; can switch to IOCTL later)
 extern const wchar_t* AegisDefaultProtectedNames[];
 extern const ULONG AegisDefaultProtectedCount;
@@ -31,6 +36,10 @@ extern const ULONG AegisBlacklistProcessCount;
 // Narrow string to match PsGetProcessImageFileName() output (ASCII, may be truncated to 15 chars on some builds)
 extern const char* AegisWhitelistProcessNames[];
 extern const ULONG AegisWhitelistProcessCount;
+
+// Blacklist DLL names (hashed into Bloom filter at init; checked in LoadImageNotify)
+extern const wchar_t* AegisBlacklistDllNames[];
+extern const ULONG AegisBlacklistDllCount;
 
 // -----------------------------------------------
 // Feature flags (for staged development and debugging)
