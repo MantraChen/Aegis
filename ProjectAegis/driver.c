@@ -1,12 +1,16 @@
 //
 // Project Aegis - Kernel driver main module
-// Minimal anti-cheat: protect designated processes from read, write, and injection.
-// Target: Windows 10/11 x64. Must be developed and tested in a VM.
+// Phase 1: Hello World + IOCTL for Ring 3 communication.
+// Target: Windows 10/11 x64. Develop and test in a VM; use dual-machine debugging.
 //
 
 #include <ntddk.h>
 #include "config.h"
 #include "protection.h"
+#include "shared_ioctl.h"
+
+#define AEGIS_DEVICE_NAME   L"\\Device\\ProjectAegis"
+#define AEGIS_LINK_NAME     L"\\DosDevices\\ProjectAegis"
 
 // -----------------------------------------------
 // Default protected process name list (matches extern in config.h)
@@ -18,14 +22,26 @@ const wchar_t* AegisDefaultProtectedNames[] = {
 const ULONG AegisDefaultProtectedCount = sizeof(AegisDefaultProtectedNames) / sizeof(AegisDefaultProtectedNames[0]);
 
 // -----------------------------------------------
-// Process create/exit notify (for protected list and future hooks)
+// PID list (dynamic via IOCTL); protected PIDs added by user-mode client
 // -----------------------------------------------
+static ULONG g_ProtectedPids[AEGIS_MAX_PROTECTED_PIDS];
+static ULONG g_ProtectedPidCount = 0;
+static KSPIN_LOCK g_PidListLock;
+
+// -----------------------------------------------
+// Device and IRP dispatch
+// -----------------------------------------------
+static PDEVICE_OBJECT g_AegisDeviceObject = NULL;
+
+static NTSTATUS AegisDispatchCreate(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp);
+static NTSTATUS AegisDispatchClose(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp);
+static NTSTATUS AegisDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp);
+
 static void AegisProcessNotifyCallback(
     _Inout_ PEPROCESS Process,
     _In_ HANDLE ProcessId,
     _In_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo
 );
-
 static BOOLEAN g_AegisCallbacksRegistered = FALSE;
 
 // -----------------------------------------------
@@ -41,8 +57,10 @@ NTSTATUS DriverEntry(
 {
     UNREFERENCED_PARAMETER(RegistryPath);
     NTSTATUS status;
+    UNICODE_STRING deviceName;
+    UNICODE_STRING linkName;
 
-    AegisDbgPrint(("[Aegis] DriverEntry\n"));
+    AegisDbgPrint(("[Aegis] DriverEntry - Hello World\n"));
 
     status = AegisProtectionInitialize();
     if (!NT_SUCCESS(status)) {
@@ -50,9 +68,44 @@ NTSTATUS DriverEntry(
         return status;
     }
 
+    RtlInitUnicodeString(&deviceName, AEGIS_DEVICE_NAME);
+    RtlInitUnicodeString(&linkName, AEGIS_LINK_NAME);
+
+    status = IoCreateDevice(
+        DriverObject,
+        0,
+        &deviceName,
+        FILE_DEVICE_UNKNOWN,
+        FILE_DEVICE_SECURE_OPEN,
+        FALSE,
+        &g_AegisDeviceObject
+    );
+    if (!NT_SUCCESS(status)) {
+        AegisDbgPrint(("[Aegis] IoCreateDevice failed: 0x%X\n", status));
+        AegisProtectionUninitialize();
+        return status;
+    }
+
+    status = IoCreateSymbolicLink(&linkName, &deviceName);
+    if (!NT_SUCCESS(status)) {
+        AegisDbgPrint(("[Aegis] IoCreateSymbolicLink failed: 0x%X\n", status));
+        IoDeleteDevice(g_AegisDeviceObject);
+        g_AegisDeviceObject = NULL;
+        AegisProtectionUninitialize();
+        return status;
+    }
+
+    DriverObject->MajorFunction[IRP_MJ_CREATE]         = AegisDispatchCreate;
+    DriverObject->MajorFunction[IRP_MJ_CLOSE]          = AegisDispatchClose;
+    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = AegisDispatchDeviceControl;
+    DriverObject->DriverUnload = DriverUnload;
+
     status = PsSetCreateProcessNotifyRoutineEx(AegisProcessNotifyCallback, FALSE);
     if (!NT_SUCCESS(status)) {
         AegisDbgPrint(("[Aegis] PsSetCreateProcessNotifyRoutineEx failed: 0x%X\n", status));
+        IoDeleteSymbolicLink(&linkName);
+        IoDeleteDevice(g_AegisDeviceObject);
+        g_AegisDeviceObject = NULL;
         AegisProtectionUninitialize();
         return status;
     }
@@ -61,30 +114,36 @@ NTSTATUS DriverEntry(
     status = AegisRegisterCallbacks();
     if (!NT_SUCCESS(status)) {
         AegisDbgPrint(("[Aegis] AegisRegisterCallbacks failed: 0x%X\n", status));
-        if (g_AegisCallbacksRegistered) {
-            PsSetCreateProcessNotifyRoutineEx(AegisProcessNotifyCallback, TRUE);
-            g_AegisCallbacksRegistered = FALSE;
-        }
+        PsSetCreateProcessNotifyRoutineEx(AegisProcessNotifyCallback, TRUE);
+        g_AegisCallbacksRegistered = FALSE;
+        IoDeleteSymbolicLink(&linkName);
+        IoDeleteDevice(g_AegisDeviceObject);
+        g_AegisDeviceObject = NULL;
         AegisProtectionUninitialize();
         return status;
     }
 
-    DriverObject->DriverUnload = DriverUnload;
-    AegisDbgPrint(("[Aegis] DriverEntry OK\n"));
+    AegisDbgPrint(("[Aegis] DriverEntry OK; device \\Device\\ProjectAegis\n"));
     return STATUS_SUCCESS;
 }
 
 void DriverUnload(_In_ PDRIVER_OBJECT DriverObject)
 {
-    UNREFERENCED_PARAMETER(DriverObject);
+    UNICODE_STRING linkName;
 
     AegisDbgPrint(("[Aegis] DriverUnload\n"));
 
     AegisUnregisterCallbacks();
-
     if (g_AegisCallbacksRegistered) {
         PsSetCreateProcessNotifyRoutineEx(AegisProcessNotifyCallback, TRUE);
         g_AegisCallbacksRegistered = FALSE;
+    }
+
+    RtlInitUnicodeString(&linkName, AEGIS_LINK_NAME);
+    IoDeleteSymbolicLink(&linkName);
+    if (g_AegisDeviceObject) {
+        IoDeleteDevice(g_AegisDeviceObject);
+        g_AegisDeviceObject = NULL;
     }
 
     AegisProtectionUninitialize();
@@ -92,17 +151,138 @@ void DriverUnload(_In_ PDRIVER_OBJECT DriverObject)
 }
 
 // -----------------------------------------------
-// Protection logic (skeleton; extend with Ob callbacks, memory/injection hooks)
+// IRP dispatch: Create, Close
+// -----------------------------------------------
+static NTSTATUS AegisDispatchCreate(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS AegisDispatchClose(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+// -----------------------------------------------
+// IRP dispatch: DeviceControl (IOCTL)
+// -----------------------------------------------
+static NTSTATUS AegisDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
+{
+    PIO_STACK_LOCATION stack;
+    ULONG code;
+    NTSTATUS status = STATUS_SUCCESS;
+    ULONG inSize, outSize;
+    PVOID inBuf, outBuf;
+    AEGIS_STATUS_OUTPUT outData;
+    KIRQL oldIrql;
+
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    stack = IoGetCurrentIrpStackLocation(Irp);
+    code  = stack->Parameters.DeviceIoControl.IoControlCode;
+    inSize  = stack->Parameters.DeviceIoControl.InputBufferLength;
+    outSize = stack->Parameters.DeviceIoControl.OutputBufferLength;
+    inBuf   = Irp->AssociatedIrp.SystemBuffer;
+    outBuf  = Irp->AssociatedIrp.SystemBuffer;
+
+    RtlZeroMemory(&outData, sizeof(outData));
+
+    switch (code) {
+    case IOCTL_AEGIS_PROTECT_PID: {
+        PAEGIS_PID_INPUT in = (PAEGIS_PID_INPUT)inBuf;
+        if (inSize < sizeof(AEGIS_PID_INPUT) || in == NULL) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            outData.StatusCode = (ULONG)status;
+            break;
+        }
+        KeAcquireSpinLock(&g_PidListLock, &oldIrql);
+        if (g_ProtectedPidCount >= AEGIS_MAX_PROTECTED_PIDS) {
+            KeReleaseSpinLock(&g_PidListLock, oldIrql);
+            status = STATUS_TOO_MANY_NAMES;
+            outData.StatusCode = (ULONG)status;
+            break;
+        }
+        g_ProtectedPids[g_ProtectedPidCount++] = in->Pid;
+        outData.ProtectedCount = g_ProtectedPidCount;
+        outData.StatusCode = 0;
+        KeReleaseSpinLock(&g_PidListLock, oldIrql);
+        AegisDbgPrint(("[Aegis] IOCTL protect PID %u; total %u\n", in->Pid, g_ProtectedPidCount));
+        break;
+    }
+    case IOCTL_AEGIS_UNPROTECT_PID: {
+        PAEGIS_PID_INPUT in = (PAEGIS_PID_INPUT)inBuf;
+        ULONG i, j;
+        BOOLEAN found = FALSE;
+        if (inSize < sizeof(AEGIS_PID_INPUT) || in == NULL) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            outData.StatusCode = (ULONG)status;
+            break;
+        }
+        KeAcquireSpinLock(&g_PidListLock, &oldIrql);
+        for (i = 0; i < g_ProtectedPidCount; i++) {
+            if (g_ProtectedPids[i] == in->Pid) {
+                for (j = i; j + 1 < g_ProtectedPidCount; j++)
+                    g_ProtectedPids[j] = g_ProtectedPids[j + 1];
+                g_ProtectedPidCount--;
+                found = TRUE;
+                break;
+            }
+        }
+        outData.ProtectedCount = g_ProtectedPidCount;
+        outData.StatusCode = found ? 0 : (ULONG)STATUS_NOT_FOUND;
+        KeReleaseSpinLock(&g_PidListLock, oldIrql);
+        AegisDbgPrint(("[Aegis] IOCTL unprotect PID %u; total %u\n", in->Pid, g_ProtectedPidCount));
+        break;
+    }
+    case IOCTL_AEGIS_GET_STATUS:
+        KeAcquireSpinLock(&g_PidListLock, &oldIrql);
+        outData.ProtectedCount = g_ProtectedPidCount;
+        outData.StatusCode = 0;
+        KeReleaseSpinLock(&g_PidListLock, oldIrql);
+        if (outSize < sizeof(AEGIS_STATUS_OUTPUT)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        RtlCopyMemory(outBuf, &outData, sizeof(outData));
+        Irp->IoStatus.Information = sizeof(AEGIS_STATUS_OUTPUT);
+        break;
+    default:
+        status = STATUS_INVALID_DEVICE_REQUEST;
+        outData.StatusCode = (ULONG)status;
+        break;
+    }
+
+    if (code != IOCTL_AEGIS_GET_STATUS && outSize >= sizeof(AEGIS_STATUS_OUTPUT))
+        RtlCopyMemory(outBuf, &outData, sizeof(outData));
+    if (code != IOCTL_AEGIS_GET_STATUS && outSize >= sizeof(AEGIS_STATUS_OUTPUT))
+        Irp->IoStatus.Information = sizeof(AEGIS_STATUS_OUTPUT);
+
+    Irp->IoStatus.Status = status;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return status;
+}
+
+// -----------------------------------------------
+// Protection logic: PID list + name list
 // -----------------------------------------------
 NTSTATUS AegisProtectionInitialize(void)
 {
-    // Currently uses default list only; later: registry or IOCTL config
+    KeInitializeSpinLock(&g_PidListLock);
+    g_ProtectedPidCount = 0;
     return STATUS_SUCCESS;
 }
 
 void AegisProtectionUninitialize(void)
 {
-    // Release protected list etc. (no dynamic allocation in this skeleton)
+    g_ProtectedPidCount = 0;
 }
 
 BOOLEAN AegisIsProcessProtected(PEPROCESS Process)
@@ -115,8 +295,17 @@ BOOLEAN AegisIsProcessProtected(PEPROCESS Process)
 
 BOOLEAN AegisIsProcessProtectedByPid(HANDLE Pid)
 {
-    UNREFERENCED_PARAMETER(Pid);
-    // Skeleton: full impl would maintain PID <-> image name mapping
+    ULONG i;
+    ULONG pidVal = (ULONG)(ULONG_PTR)Pid;
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&g_PidListLock, &oldIrql);
+    for (i = 0; i < g_ProtectedPidCount; i++) {
+        if (g_ProtectedPids[i] == pidVal) {
+            KeReleaseSpinLock(&g_PidListLock, oldIrql);
+            return TRUE;
+        }
+    }
+    KeReleaseSpinLock(&g_PidListLock, oldIrql);
     return FALSE;
 }
 
@@ -135,17 +324,15 @@ BOOLEAN AegisIsProcessProtectedByImageName(PCUNICODE_STRING ImageName)
 
 NTSTATUS AegisRegisterCallbacks(void)
 {
-    // Stub: ObRegisterCallbacks (handle restrict), PsSetLoadImageNotifyRoutine (DLL inject), etc.
     return STATUS_SUCCESS;
 }
 
 void AegisUnregisterCallbacks(void)
 {
-    // Paired with AegisRegisterCallbacks
 }
 
 // -----------------------------------------------
-// Process notify implementation
+// Process notify
 // -----------------------------------------------
 static void AegisProcessNotifyCallback(
     _Inout_ PEPROCESS Process,
@@ -159,7 +346,6 @@ static void AegisProcessNotifyCallback(
     if (CreateInfo != NULL && CreateInfo->ImageFileName != NULL) {
         if (AegisIsProcessProtectedByImageName(CreateInfo->ImageFileName)) {
             AegisDbgPrint(("[Aegis] Protected process created: %wZ\n", CreateInfo->ImageFileName));
-            // Optional: extra init here (Ob callbacks, memory protection, etc.)
         }
     }
 }

@@ -14,6 +14,7 @@ extern "C" {
 // Match by image name, case-insensitive; can extend to PID/path later.
 // -----------------------------------------------
 #define AEGIS_MAX_PROTECTED_NAMES  8
+#define AEGIS_MAX_PROTECTED_PIDS   64  // max PIDs that can be added via IOCTL
 #define AEGIS_MAX_IMAGE_NAME_LEN  260
 
 // Default protected names (defined in driver.c; can switch to IOCTL later)

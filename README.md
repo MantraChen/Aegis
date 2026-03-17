@@ -18,12 +18,19 @@ This project is for **training my own project and systems programming skills** (
 Project Aegis/
 ├── README.md
 ├── ProjectAegis.sln              # Visual Studio solution
-└── ProjectAegis/
-    ├── ProjectAegis.vcxproj     # WDK driver project (WDM, x64)
-    ├── ProjectAegis.inf         # Driver install info (dev/test)
-    ├── driver.c                 # Entry, unload, process notify, protection skeleton
-    ├── config.h                 # Protected process names, feature flags, debug macros
-    └── protection.h             # Protection API declarations
+├── Shared/
+│   └── shared_ioctl.h            # IOCTL codes and structs (driver + client)
+├── docs/
+│   └── Phase1-DualMachineDebug.md # Dual-machine kernel debugging setup
+├── ProjectAegis/                 # Kernel driver (Ring 0)
+│   ├── ProjectAegis.vcxproj
+│   ├── ProjectAegis.inf
+│   ├── driver.c                  # Entry, unload, device, IOCTL, protection
+│   ├── config.h
+│   └── protection.h
+└── AegisClient/                  # User-mode console (Ring 3)
+    ├── AegisClient.vcxproj
+    └── main.c                    # Sends protect/unprotect/status IOCTLs
 ```
 
 ---
@@ -71,16 +78,39 @@ msbuild ProjectAegis.sln /p:Configuration=Debug /p:Platform=x64
 
 ---
 
-## Current implementation (skeleton)
+## Phase 1: Environment and “Hello World” driver
 
-- **DriverEntry / DriverUnload**: Initialize/teardown protection, register/unregister process create notify.
-- **Process create notify**: `PsSetCreateProcessNotifyRoutineEx` to detect protected processes by image name.
-- **Protection API** (`protection.h` / `driver.c`):  
-  - `AegisProtectionInitialize` / `AegisProtectionUninitialize`  
-  - `AegisIsProcessProtected` / `AegisIsProcessProtectedByPid` / `AegisIsProcessProtectedByImageName`  
-  - `AegisRegisterCallbacks` / `AegisUnregisterCallbacks` (stubs for Ob callbacks, image notify, etc.)
+**Task 1 – Dual-machine debugging**  
+- **Host (physical)**: Visual Studio + WinDbg.  
+- **Guest (VM)**: Test Windows where the driver runs.  
+Step-by-step: [docs/Phase1-DualMachineDebug.md](docs/Phase1-DualMachineDebug.md).
 
-**Default protected image names** are `GameClient.exe` and `TestProtected.exe` (see `config.h` / `driver.c`); they can be changed or later made configurable via IOCTL.
+**Task 2 – Minimal driver**  
+- **DriverEntry**: Creates device `\Device\ProjectAegis`, symbolic link `\DosDevices\ProjectAegis`, registers IRP dispatch (Create, Close, DeviceControl), then process notify and protection init.  
+- **DriverUnload**: Unregisters callbacks, deletes link and device.
+
+**Task 3 – IOCTL and Ring 3 client**  
+- **Driver**: Handles `IOCTL_AEGIS_PROTECT_PID`, `IOCTL_AEGIS_UNPROTECT_PID`, `IOCTL_AEGIS_GET_STATUS` (see `Shared/shared_ioctl.h`).  
+- **AegisClient**: Console app that opens `\\.\ProjectAegis` and sends commands.  
+  - Build the solution (driver + AegisClient).  
+  - On the **guest**, load the driver (`sc start ProjectAegis`).  
+  - Run **AegisClient.exe** as Administrator:
+
+```bat
+AegisClient.exe protect 1234
+AegisClient.exe unprotect 1234
+AegisClient.exe status
+```
+
+---
+
+## Current implementation (Phase 1)
+
+- **Driver**: Device `\Device\ProjectAegis`, symbolic link for `\\.\ProjectAegis`, IRP Create/Close/DeviceControl.
+- **IOCTLs**: Protect PID, unprotect PID, get status (protected count); shared definitions in `Shared/shared_ioctl.h`.
+- **Protected list**: PIDs added via IOCTL (plus default image names in code). `AegisIsProcessProtectedByPid` checks the list.
+- **Process notify**: `PsSetCreateProcessNotifyRoutineEx` still used for image-name-based protection.
+- **AegisClient**: Ring 3 console; `protect <PID>`, `unprotect <PID>`, `status`.
 
 ---
 
