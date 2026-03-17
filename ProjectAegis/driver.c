@@ -640,30 +640,63 @@ static NTSTATUS AegisDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In
 // -----------------------------------------------
 static ULONG64 AegisGetProcessCr3(_In_ PEPROCESS Process)
 {
-    KAPC_STATE apcState;
     ULONG64 cr3;
 
     if (Process == NULL) return 0;
-    KeStackAttachProcess(Process, &apcState);
-    cr3 = __readcr3();
-    KeUnstackDetachProcess(&apcState);
-    /* CR3 bits 12-51 = PML4 physical base (4-level paging) */
+
+#if AEGIS_HAS_EPROCESS_CR3_OFFSET
+    cr3 = *(ULONG64 *)((PUCHAR)Process + AEGIS_EPROCESS_CR3_OFFSET);
     return cr3 & AEGIS_PFN_MASK;
+#else
+    {
+        KAPC_STATE apcState;
+        KeStackAttachProcess(Process, &apcState);
+        cr3 = __readcr3();
+        KeUnstackDetachProcess(&apcState);
+        return cr3 & AEGIS_PFN_MASK;
+    }
+#endif
 }
 
-/* Map one physical page and read 8 bytes at Pa (must be 8-byte aligned). */
 static ULONG64 AegisReadPhysical(ULONG64 Pa)
 {
-    PHYSICAL_ADDRESS phys;
-    PVOID mapped;
-    ULONG64 value;
+    MM_COPY_ADDRESS src;
+    ULONG64 value = 0;
+    SIZE_T bytesRead = 0;
+    NTSTATUS status;
 
-    phys.QuadPart = (LONGLONG)(Pa & ~0xFFFULL);
-    mapped = MmMapIoSpace(phys, AEGIS_PAGE_SIZE, MmNonCached);
-    if (mapped == NULL) return 0;
-    value = *(ULONG64*)((PUCHAR)mapped + (Pa & 0xFFF));
-    MmUnmapIoSpace(mapped, AEGIS_PAGE_SIZE);
+    src.PhysicalAddress.QuadPart = (LONGLONG)Pa;
+
+    status = MmCopyMemory(
+        &value,
+        src,
+        sizeof(ULONG64),
+        MM_COPY_MEMORY_PHYSICAL,
+        &bytesRead
+    );
+
+    if (!NT_SUCCESS(status) || bytesRead != sizeof(ULONG64)) {
+        return 0;
+    }
+
     return value;
+}
+
+// -----------------------------------------------
+// PTE backend abstraction – future Hypervisor/EPT hook point
+// -----------------------------------------------
+
+/* 统一的 PTE 查询入口：未来可在此接入 Hypervisor / EPT 视角。 */
+static ULONG64 AegisQueryPteForVa(ULONG64 Pml4Pa, ULONG_PTR Va)
+{
+#if AEGIS_HAS_HYPERVISOR
+    //
+    // 预留：当有 Hypervisor 时，在这里通过 VMCall/共享内存等方式，
+    // 向 Ring -1 查询 VA 对应的最终执行权限 / PTE 值。
+    // 目前先退回到 Guest 内核视角的 PTE Walk。
+    //
+#endif
+    return AegisPteWalk(Pml4Pa, Va);
 }
 
 /* Four-level walk: PML4 -> PDPT -> PD -> PT; return final PTE (or PDE for 2MB page). Returns 0 if not present. */
@@ -905,10 +938,10 @@ static NTSTATUS AegisScanProcessVad(_In_ ULONG Pid, _Out_ PAEGIS_VAD_SCAN_OUTPUT
                 Pid, mbi.BaseAddress, mbi.RegionSize));
         }
 
-        /* PTE-VAD discrepancy: VAD says non-executable but PTE has NX clear (possible PTE tampering) */
+        /* PTE-VAD discrepancy: VAD says non-executable but low-level PTE backend报告为可执行（可能的 PTE / EPT 篡改） */
         if (cr3 != 0 && mbi.State == MEM_COMMIT && discCount < AEGIS_MAX_PTE_DISCREPANCY) {
             if ((mbi.Protect & AEGIS_VAD_EXEC_MASK) == 0) {
-                ULONG64 pte = AegisPteWalk(cr3, (ULONG_PTR)mbi.BaseAddress);
+                ULONG64 pte = AegisQueryPteForVa(cr3, (ULONG_PTR)mbi.BaseAddress);
                 if (pte != 0 && (pte & AEGIS_PTE_NX) == 0) {
                     Output->Discrepancies[discCount].Va = (ULONG_PTR)mbi.BaseAddress;
                     Output->Discrepancies[discCount].VadProtect = mbi.Protect;

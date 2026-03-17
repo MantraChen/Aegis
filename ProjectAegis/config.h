@@ -51,6 +51,22 @@ extern const ULONG AegisBlacklistDllCount;
 #define AEGIS_PROTECT_INJECT 1   // Block DLL/code injection (e.g. LoadLibrary image notify)
 
 // -----------------------------------------------
+// Hypervisor / EPT integration
+// -----------------------------------------------
+// 未来如果 Project Aegis 进化为 Hypervisor，可以把 AEGIS_HAS_HYPERVISOR 置为 1，
+// 并在驱动或外部组件中实现基于 EPT 的 PTE 查询逻辑，取代纯 Guest PTE Walk。
+#define AEGIS_HAS_HYPERVISOR 0
+
+// -----------------------------------------------
+// EPROCESS -> DirectoryTableBase (CR3) offset
+// -----------------------------------------------
+// 当你通过特征码扫描/符号信息确定 EPROCESS 中 DirectoryTableBase 的偏移后，
+// 可以把 AEGIS_HAS_EPROCESS_CR3_OFFSET 设为 1，并设置正确的 AEGIS_EPROCESS_CR3_OFFSET，
+// 这样 AegisGetProcessCr3 就会直接从 EPROCESS 读取 CR3，而不再使用 KeStackAttachProcess。
+#define AEGIS_HAS_EPROCESS_CR3_OFFSET   0
+#define AEGIS_EPROCESS_CR3_OFFSET       0x0
+
+// -----------------------------------------------
 // Debug
 // -----------------------------------------------
 #define AEGIS_DEBUG_PRINT 1

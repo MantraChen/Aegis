@@ -264,6 +264,7 @@ int main(int argc, char** argv)
         }
         ZeroMemory(&out, sizeof(out));
         ok = DeviceIoControl(
+            
             hDev,
             IOCTL_AEGIS_REMOVE_RANGE,
             &rangeIn,
