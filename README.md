@@ -161,7 +161,8 @@ Cheats often use `OpenProcess` with `PROCESS_VM_READ` (or `PROCESS_ALL_ACCESS`) 
 
 ## Current implementation (Phase 1 + Phase 2 + Phase 3 + Phase 4)
 
-- **Driver**: Device, IOCTL, protected PID list, process/thread/image callbacks, Ob process callbacks, **VAD-style scan**.
+- **Driver**: Device, IOCTL, protected PID list (**lock-free**), process/thread/image callbacks, Ob process callbacks, **VAD-style scan**.
+- **Concurrent PID list**: The protected-PID set is updated with **InterlockedCompareExchange** (CAS) and **InterlockedIncrement/Decrement**; **no spinlock** is taken on the read path. Callbacks (Ob, thread, image) only read the array, so handle create/duplicate no longer contend on a global lock.
 - **Process**: Blacklist block + protected-process creation log.
 - **Thread**: Remote threads in protected processes are terminated.
 - **Image**: All image loads into protected processes are logged.

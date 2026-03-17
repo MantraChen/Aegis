@@ -60,11 +60,11 @@ const char* AegisWhitelistProcessNames[] = {
 const ULONG AegisWhitelistProcessCount = sizeof(AegisWhitelistProcessNames) / sizeof(AegisWhitelistProcessNames[0]);
 
 // -----------------------------------------------
-// PID list (dynamic via IOCTL); protected PIDs added by user-mode client
+// PID list (dynamic via IOCTL) – lock-free for read path (Ob/thread/image callbacks)
+// Writers (IOCTL) use InterlockedCompareExchange; readers just read the array (no lock).
 // -----------------------------------------------
-static ULONG g_ProtectedPids[AEGIS_MAX_PROTECTED_PIDS];
-static ULONG g_ProtectedPidCount = 0;
-static KSPIN_LOCK g_PidListLock;
+static volatile ULONG g_ProtectedPids[AEGIS_MAX_PROTECTED_PIDS];
+static volatile LONG g_ProtectedPidCount = 0;
 
 // -----------------------------------------------
 // Device and IRP dispatch
@@ -237,7 +237,6 @@ static NTSTATUS AegisDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In
     ULONG inSize, outSize;
     PVOID inBuf, outBuf;
     AEGIS_STATUS_OUTPUT outData;
-    KIRQL oldIrql;
 
     UNREFERENCED_PARAMETER(DeviceObject);
 
@@ -253,55 +252,65 @@ static NTSTATUS AegisDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In
     switch (code) {
     case IOCTL_AEGIS_PROTECT_PID: {
         PAEGIS_PID_INPUT in = (PAEGIS_PID_INPUT)inBuf;
+        ULONG i;
+        BOOLEAN inserted = FALSE;
         if (inSize < sizeof(AEGIS_PID_INPUT) || in == NULL) {
             status = STATUS_BUFFER_TOO_SMALL;
             outData.StatusCode = (ULONG)status;
             break;
         }
-        KeAcquireSpinLock(&g_PidListLock, &oldIrql);
-        if (g_ProtectedPidCount >= AEGIS_MAX_PROTECTED_PIDS) {
-            KeReleaseSpinLock(&g_PidListLock, oldIrql);
+        /* Already in list? (lock-free read) */
+        for (i = 0; i < AEGIS_MAX_PROTECTED_PIDS; i++) {
+            if (g_ProtectedPids[i] == in->Pid) {
+                outData.ProtectedCount = (ULONG)InterlockedOr(&g_ProtectedPidCount, 0);
+                outData.StatusCode = 0;
+                inserted = TRUE;
+                break;
+            }
+        }
+        if (!inserted) {
+            for (i = 0; i < AEGIS_MAX_PROTECTED_PIDS; i++) {
+                if (InterlockedCompareExchange((LONG*)&g_ProtectedPids[i], (LONG)in->Pid, 0) == 0) {
+                    InterlockedIncrement(&g_ProtectedPidCount);
+                    outData.ProtectedCount = (ULONG)InterlockedOr(&g_ProtectedPidCount, 0);
+                    outData.StatusCode = 0;
+                    inserted = TRUE;
+                    break;
+                }
+            }
+        }
+        if (!inserted) {
             status = STATUS_TOO_MANY_NAMES;
             outData.StatusCode = (ULONG)status;
-            break;
+            outData.ProtectedCount = (ULONG)InterlockedOr(&g_ProtectedPidCount, 0);
         }
-        g_ProtectedPids[g_ProtectedPidCount++] = in->Pid;
-        outData.ProtectedCount = g_ProtectedPidCount;
-        outData.StatusCode = 0;
-        KeReleaseSpinLock(&g_PidListLock, oldIrql);
-        AegisDbgPrint(("[Aegis] IOCTL protect PID %u; total %u\n", in->Pid, g_ProtectedPidCount));
+        AegisDbgPrint(("[Aegis] IOCTL protect PID %u; total %u\n", in->Pid, outData.ProtectedCount));
         break;
     }
     case IOCTL_AEGIS_UNPROTECT_PID: {
         PAEGIS_PID_INPUT in = (PAEGIS_PID_INPUT)inBuf;
-        ULONG i, j;
+        ULONG i;
         BOOLEAN found = FALSE;
         if (inSize < sizeof(AEGIS_PID_INPUT) || in == NULL) {
             status = STATUS_BUFFER_TOO_SMALL;
             outData.StatusCode = (ULONG)status;
             break;
         }
-        KeAcquireSpinLock(&g_PidListLock, &oldIrql);
-        for (i = 0; i < g_ProtectedPidCount; i++) {
-            if (g_ProtectedPids[i] == in->Pid) {
-                for (j = i; j + 1 < g_ProtectedPidCount; j++)
-                    g_ProtectedPids[j] = g_ProtectedPids[j + 1];
-                g_ProtectedPidCount--;
+        for (i = 0; i < AEGIS_MAX_PROTECTED_PIDS; i++) {
+            if (InterlockedCompareExchange((LONG*)&g_ProtectedPids[i], 0, (LONG)in->Pid) == (LONG)in->Pid) {
+                InterlockedDecrement(&g_ProtectedPidCount);
                 found = TRUE;
                 break;
             }
         }
-        outData.ProtectedCount = g_ProtectedPidCount;
+        outData.ProtectedCount = (ULONG)InterlockedOr(&g_ProtectedPidCount, 0);
         outData.StatusCode = found ? 0 : (ULONG)STATUS_NOT_FOUND;
-        KeReleaseSpinLock(&g_PidListLock, oldIrql);
-        AegisDbgPrint(("[Aegis] IOCTL unprotect PID %u; total %u\n", in->Pid, g_ProtectedPidCount));
+        AegisDbgPrint(("[Aegis] IOCTL unprotect PID %u; total %u\n", in->Pid, outData.ProtectedCount));
         break;
     }
     case IOCTL_AEGIS_GET_STATUS:
-        KeAcquireSpinLock(&g_PidListLock, &oldIrql);
-        outData.ProtectedCount = g_ProtectedPidCount;
+        outData.ProtectedCount = (ULONG)InterlockedOr(&g_ProtectedPidCount, 0);
         outData.StatusCode = 0;
-        KeReleaseSpinLock(&g_PidListLock, oldIrql);
         if (outSize < sizeof(AEGIS_STATUS_OUTPUT)) {
             status = STATUS_BUFFER_TOO_SMALL;
             break;
@@ -409,14 +418,16 @@ static NTSTATUS AegisScanProcessVad(_In_ ULONG Pid, _Out_ PAEGIS_VAD_SCAN_OUTPUT
 // -----------------------------------------------
 NTSTATUS AegisProtectionInitialize(void)
 {
-    KeInitializeSpinLock(&g_PidListLock);
-    g_ProtectedPidCount = 0;
+    ULONG i;
+    InterlockedExchange(&g_ProtectedPidCount, 0);
+    for (i = 0; i < AEGIS_MAX_PROTECTED_PIDS; i++)
+        InterlockedExchange((LONG*)&g_ProtectedPids[i], 0);
     return STATUS_SUCCESS;
 }
 
 void AegisProtectionUninitialize(void)
 {
-    g_ProtectedPidCount = 0;
+    InterlockedExchange(&g_ProtectedPidCount, 0);
 }
 
 BOOLEAN AegisIsProcessProtected(PEPROCESS Process)
@@ -431,15 +442,11 @@ BOOLEAN AegisIsProcessProtectedByPid(HANDLE Pid)
 {
     ULONG i;
     ULONG pidVal = (ULONG)(ULONG_PTR)Pid;
-    KIRQL oldIrql;
-    KeAcquireSpinLock(&g_PidListLock, &oldIrql);
-    for (i = 0; i < g_ProtectedPidCount; i++) {
-        if (g_ProtectedPids[i] == pidVal) {
-            KeReleaseSpinLock(&g_PidListLock, oldIrql);
+    /* Lock-free read: full array scan; each slot read is atomic (aligned ULONG on x64) */
+    for (i = 0; i < AEGIS_MAX_PROTECTED_PIDS; i++) {
+        if (g_ProtectedPids[i] == pidVal)
             return TRUE;
-        }
     }
-    KeReleaseSpinLock(&g_PidListLock, oldIrql);
     return FALSE;
 }
 
