@@ -15,6 +15,8 @@ extern "C" {
 // -----------------------------------------------
 #define AEGIS_MAX_PROTECTED_NAMES  8
 #define AEGIS_MAX_PROTECTED_PIDS   64  // max PIDs that can be added via IOCTL
+#define AEGIS_MAX_RANGE_CONTEXTS  64  // max (PID -> interval tree) entries for memory range protection
+#define AEGIS_MAX_RANGES_PER_PID  256 // max intervals per process (cap for O(log N) tree depth)
 #define AEGIS_MAX_IMAGE_NAME_LEN  260
 #define AEGIS_MAX_BLACKLIST_NAMES  16  // process names to block (e.g. cheat tools)
 #define AEGIS_MAX_WHITELIST_NAMES  24  // process names allowed to open protected process with full access (Phase 3)

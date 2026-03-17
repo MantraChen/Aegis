@@ -169,6 +169,36 @@ static volatile ULONG g_ProtectedPids[AEGIS_MAX_PROTECTED_PIDS];
 static volatile LONG g_ProtectedPidCount = 0;
 
 // -----------------------------------------------
+// Memory range protection: interval tree per process, O(log N) point-in-range query
+// -----------------------------------------------
+typedef struct _AEGIS_RANGE_NODE {
+    ULONG_PTR Low;
+    ULONG_PTR High;
+    ULONG_PTR MaxHigh;  // max High in this subtree (augmented for interval query)
+    struct _AEGIS_RANGE_NODE* Left;
+    struct _AEGIS_RANGE_NODE* Right;
+} AEGIS_RANGE_NODE, *PAEGIS_RANGE_NODE;
+
+typedef struct _AEGIS_RANGE_CONTEXT {
+    ULONG Pid;
+    PAEGIS_RANGE_NODE Root;
+    ULONG NodeCount;
+} AEGIS_RANGE_CONTEXT, *PAEGIS_RANGE_CONTEXT;
+
+#define AEGIS_RANGE_POOL_TAG 'egiA'
+static AEGIS_RANGE_CONTEXT g_RangeContexts[AEGIS_MAX_RANGE_CONTEXTS];
+static KSPIN_LOCK g_RangeTreeLock;
+
+static PAEGIS_RANGE_NODE AegisRangeNodeAlloc(ULONG_PTR Low, ULONG_PTR High);
+static void AegisRangeNodeFree(PAEGIS_RANGE_NODE Node);
+static PAEGIS_RANGE_NODE AegisRangeInsert(PAEGIS_RANGE_NODE Root, ULONG_PTR Low, ULONG_PTR High, PULONG NodeCount);
+static PAEGIS_RANGE_NODE AegisRangeRemove(PAEGIS_RANGE_NODE Root, ULONG_PTR Low, ULONG_PTR High, PULONG NodeCount);
+static BOOLEAN AegisRangeQuery(PAEGIS_RANGE_NODE Root, ULONG_PTR Addr);
+static void AegisRangeTreeFree(PAEGIS_RANGE_NODE Root);
+static PAEGIS_RANGE_CONTEXT AegisRangeContextFind(ULONG Pid);
+static PAEGIS_RANGE_CONTEXT AegisRangeContextForPid(ULONG Pid);
+
+// -----------------------------------------------
 // Device and IRP dispatch
 // -----------------------------------------------
 static PDEVICE_OBJECT g_AegisDeviceObject = NULL;
@@ -436,6 +466,58 @@ static NTSTATUS AegisDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In
             Irp->IoStatus.Information = sizeof(AEGIS_VAD_SCAN_OUTPUT);
         break;
     }
+    case IOCTL_AEGIS_ADD_RANGE: {
+        PAEGIS_RANGE_INPUT in = (PAEGIS_RANGE_INPUT)inBuf;
+        KIRQL oldIrql;
+        PAEGIS_RANGE_CONTEXT ctx;
+        if (inSize < sizeof(AEGIS_RANGE_INPUT) || in == NULL) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            outData.StatusCode = (ULONG)status;
+            break;
+        }
+        if (in->Low >= in->High) {
+            status = STATUS_INVALID_PARAMETER;
+            outData.StatusCode = (ULONG)status;
+            break;
+        }
+        KeAcquireSpinLock(&g_RangeTreeLock, &oldIrql);
+        ctx = AegisRangeContextForPid(in->Pid);
+        if (ctx == NULL) {
+            KeReleaseSpinLock(&g_RangeTreeLock, oldIrql);
+            status = STATUS_TOO_MANY_NAMES;
+            outData.StatusCode = (ULONG)status;
+            break;
+        }
+        if (ctx->NodeCount >= AEGIS_MAX_RANGES_PER_PID) {
+            KeReleaseSpinLock(&g_RangeTreeLock, oldIrql);
+            status = STATUS_TOO_MANY_NAMES;
+            outData.StatusCode = (ULONG)status;
+            break;
+        }
+        ctx->Root = AegisRangeInsert(ctx->Root, in->Low, in->High, &ctx->NodeCount);
+        KeReleaseSpinLock(&g_RangeTreeLock, oldIrql);
+        outData.StatusCode = 0;
+        AegisDbgPrint(("[Aegis] IOCTL add range PID %u [%p, %p)\n", in->Pid, (void*)in->Low, (void*)in->High));
+        break;
+    }
+    case IOCTL_AEGIS_REMOVE_RANGE: {
+        PAEGIS_RANGE_INPUT in = (PAEGIS_RANGE_INPUT)inBuf;
+        KIRQL oldIrql;
+        PAEGIS_RANGE_CONTEXT ctx;
+        if (inSize < sizeof(AEGIS_RANGE_INPUT) || in == NULL) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            outData.StatusCode = (ULONG)status;
+            break;
+        }
+        KeAcquireSpinLock(&g_RangeTreeLock, &oldIrql);
+        ctx = AegisRangeContextFind(in->Pid);
+        if (ctx != NULL)
+            ctx->Root = AegisRangeRemove(ctx->Root, in->Low, in->High, &ctx->NodeCount);
+        KeReleaseSpinLock(&g_RangeTreeLock, oldIrql);
+        outData.StatusCode = (ctx != NULL) ? 0 : (ULONG)STATUS_NOT_FOUND;
+        AegisDbgPrint(("[Aegis] IOCTL remove range PID %u [%p, %p)\n", in->Pid, (void*)in->Low, (void*)in->High));
+        break;
+    }
     default:
         status = STATUS_INVALID_DEVICE_REQUEST;
         outData.StatusCode = (ULONG)status;
@@ -507,6 +589,154 @@ static ULONG64 AegisPteWalk(ULONG64 Pml4Pa, ULONG_PTR Va)
 
     e4 = AegisReadPhysical(pt_pa + AEGIS_VA_PT_I(Va) * 8);
     return e4;
+}
+
+// -----------------------------------------------
+// Interval tree: [Low, High), keyed by Low then High; MaxHigh = max endpoint in subtree
+// -----------------------------------------------
+static PAEGIS_RANGE_NODE AegisRangeNodeAlloc(ULONG_PTR Low, ULONG_PTR High)
+{
+    PAEGIS_RANGE_NODE n = (PAEGIS_RANGE_NODE)ExAllocatePoolWithTag(NonPagedPool, sizeof(AEGIS_RANGE_NODE), AEGIS_RANGE_POOL_TAG);
+    if (n == NULL) return NULL;
+    n->Low = Low;
+    n->High = High;
+    n->MaxHigh = High;
+    n->Left = n->Right = NULL;
+    return n;
+}
+
+static void AegisRangeNodeFree(PAEGIS_RANGE_NODE Node)
+{
+    if (Node != NULL)
+        ExFreePoolWithTag(Node, AEGIS_RANGE_POOL_TAG);
+}
+
+static ULONG_PTR AegisRangeMaxHigh(PAEGIS_RANGE_NODE N)
+{
+    return N != NULL ? N->MaxHigh : 0;
+}
+
+/* Insert [Low, High); key = (Low, High) lexicographic; return new root. */
+static PAEGIS_RANGE_NODE AegisRangeInsert(PAEGIS_RANGE_NODE Root, ULONG_PTR Low, ULONG_PTR High, PULONG NodeCount)
+{
+    if (Root == NULL) {
+        PAEGIS_RANGE_NODE n = AegisRangeNodeAlloc(Low, High);
+        if (n != NULL && NodeCount != NULL)
+            (*NodeCount)++;
+        return n;
+    }
+    if (Low < Root->Low || (Low == Root->Low && High < Root->High))
+        Root->Left = AegisRangeInsert(Root->Left, Low, High, NodeCount);
+    else
+        Root->Right = AegisRangeInsert(Root->Right, Low, High, NodeCount);
+    Root->MaxHigh = Root->High;
+    if (AegisRangeMaxHigh(Root->Left) > Root->MaxHigh)  Root->MaxHigh = AegisRangeMaxHigh(Root->Left);
+    if (AegisRangeMaxHigh(Root->Right) > Root->MaxHigh) Root->MaxHigh = AegisRangeMaxHigh(Root->Right);
+    return Root;
+}
+
+/* Find leftmost node in subtree. */
+static PAEGIS_RANGE_NODE AegisRangeLeftmost(PAEGIS_RANGE_NODE N)
+{
+    while (N != NULL && N->Left != NULL) N = N->Left;
+    return N;
+}
+
+/* Remove node with exact (Low, High); return new root. */
+static PAEGIS_RANGE_NODE AegisRangeRemove(PAEGIS_RANGE_NODE Root, ULONG_PTR Low, ULONG_PTR High, PULONG NodeCount)
+{
+    if (Root == NULL) return NULL;
+    if (Low < Root->Low || (Low == Root->Low && High < Root->High)) {
+        Root->Left = AegisRangeRemove(Root->Left, Low, High, NodeCount);
+    } else if (Low > Root->Low || (Low == Root->Low && High > Root->High)) {
+        Root->Right = AegisRangeRemove(Root->Right, Low, High, NodeCount);
+    } else {
+        PAEGIS_RANGE_NODE tmp = Root;
+        if (Root->Left == NULL) {
+            Root = Root->Right;
+            AegisRangeNodeFree(tmp);
+            if (NodeCount != NULL) (*NodeCount)--;
+            return Root;
+        }
+        if (Root->Right == NULL) {
+            Root = Root->Left;
+            AegisRangeNodeFree(tmp);
+            if (NodeCount != NULL) (*NodeCount)--;
+            return Root;
+        }
+        PAEGIS_RANGE_NODE succ = AegisRangeLeftmost(Root->Right);
+        Root->Low = succ->Low;
+        Root->High = succ->High;
+        Root->Right = AegisRangeRemove(Root->Right, succ->Low, succ->High, NodeCount);
+        /* successor node was freed inside AegisRangeRemove and NodeCount decremented there */
+    }
+    Root->MaxHigh = Root->High;
+    if (AegisRangeMaxHigh(Root->Left) > Root->MaxHigh)  Root->MaxHigh = AegisRangeMaxHigh(Root->Left);
+    if (AegisRangeMaxHigh(Root->Right) > Root->MaxHigh) Root->MaxHigh = AegisRangeMaxHigh(Root->Right);
+    return Root;
+}
+
+/* Query: does Addr lie in any interval [Low, High)? O(log N). */
+static BOOLEAN AegisRangeQuery(PAEGIS_RANGE_NODE Root, ULONG_PTR Addr)
+{
+    if (Root == NULL) return FALSE;
+    if (Addr >= Root->Low && Addr < Root->High)
+        return TRUE;
+    if (Root->Left != NULL && Addr <= Root->Left->MaxHigh)
+        if (AegisRangeQuery(Root->Left, Addr)) return TRUE;
+    if (Root->Right != NULL)
+        return AegisRangeQuery(Root->Right, Addr);
+    return FALSE;
+}
+
+static void AegisRangeTreeFree(PAEGIS_RANGE_NODE Root)
+{
+    if (Root == NULL) return;
+    AegisRangeTreeFree(Root->Left);
+    AegisRangeTreeFree(Root->Right);
+    AegisRangeNodeFree(Root);
+}
+
+/* Find context for Pid (no create); caller must hold g_RangeTreeLock. */
+static PAEGIS_RANGE_CONTEXT AegisRangeContextFind(ULONG Pid)
+{
+    ULONG i;
+    for (i = 0; i < AEGIS_MAX_RANGE_CONTEXTS; i++) {
+        if (g_RangeContexts[i].Pid == Pid)
+            return &g_RangeContexts[i];
+    }
+    return NULL;
+}
+
+/* Find or create context for Pid; caller must hold g_RangeTreeLock. Returns NULL if table full. */
+static PAEGIS_RANGE_CONTEXT AegisRangeContextForPid(ULONG Pid)
+{
+    PAEGIS_RANGE_CONTEXT ctx = AegisRangeContextFind(Pid);
+    ULONG i;
+    if (ctx != NULL) return ctx;
+    for (i = 0; i < AEGIS_MAX_RANGE_CONTEXTS; i++) {
+        if (g_RangeContexts[i].Pid == 0) {
+            g_RangeContexts[i].Pid = Pid;
+            g_RangeContexts[i].Root = NULL;
+            g_RangeContexts[i].NodeCount = 0;
+            return &g_RangeContexts[i];
+        }
+    }
+    return NULL;
+}
+
+BOOLEAN AegisIsAddressInProtectedRange(ULONG Pid, ULONG_PTR Address)
+{
+    KIRQL oldIrql;
+    PAEGIS_RANGE_CONTEXT ctx;
+    BOOLEAN result = FALSE;
+
+    KeAcquireSpinLock(&g_RangeTreeLock, &oldIrql);
+    ctx = AegisRangeContextFind(Pid);
+    if (ctx != NULL && ctx->Root != NULL)
+        result = AegisRangeQuery(ctx->Root, Address);
+    KeReleaseSpinLock(&g_RangeTreeLock, oldIrql);
+    return result;
 }
 
 #define AEGIS_VAD_EXEC_MASK  (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
@@ -613,6 +843,9 @@ NTSTATUS AegisProtectionInitialize(void)
     for (i = 0; i < AEGIS_MAX_PROTECTED_PIDS; i++)
         InterlockedExchange((LONG*)&g_ProtectedPids[i], 0);
 
+    KeInitializeSpinLock(&g_RangeTreeLock);
+    RtlZeroMemory(g_RangeContexts, sizeof(g_RangeContexts));
+
     AegisBloomReset();
     for (i = 0; i < AegisBlacklistDllCount; i++) {
         RtlInitUnicodeString(&u, AegisBlacklistDllNames[i]);
@@ -624,6 +857,20 @@ NTSTATUS AegisProtectionInitialize(void)
 
 void AegisProtectionUninitialize(void)
 {
+    ULONG i;
+    KIRQL oldIrql;
+
+    KeAcquireSpinLock(&g_RangeTreeLock, &oldIrql);
+    for (i = 0; i < AEGIS_MAX_RANGE_CONTEXTS; i++) {
+        if (g_RangeContexts[i].Root != NULL) {
+            AegisRangeTreeFree(g_RangeContexts[i].Root);
+            g_RangeContexts[i].Root = NULL;
+            g_RangeContexts[i].NodeCount = 0;
+        }
+        g_RangeContexts[i].Pid = 0;
+    }
+    KeReleaseSpinLock(&g_RangeTreeLock, oldIrql);
+
     InterlockedExchange(&g_ProtectedPidCount, 0);
 }
 

@@ -22,6 +22,9 @@ BOOLEAN AegisIsProcessProtected(PEPROCESS Process);
 BOOLEAN AegisIsProcessProtectedByPid(HANDLE Pid);
 BOOLEAN AegisIsProcessProtectedByImageName(PCUNICODE_STRING ImageName);
 
+// True if (Pid, Address) falls inside any registered protected range (interval tree, O(log N))
+BOOLEAN AegisIsAddressInProtectedRange(ULONG Pid, ULONG_PTR Address);
+
 // -----------------------------------------------
 // Callback registration (called from driver.c in DriverEntry/Unload)
 // -----------------------------------------------

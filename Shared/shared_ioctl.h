@@ -37,6 +37,8 @@ typedef unsigned long ULONG;
 #define IOCTL_AEGIS_UNPROTECT_PID  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_AEGIS_GET_STATUS     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_AEGIS_SCAN_VAD      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_AEGIS_ADD_RANGE    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_AEGIS_REMOVE_RANGE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // -----------------------------------------------
 // Input: protect / unprotect by PID
@@ -44,6 +46,15 @@ typedef unsigned long ULONG;
 typedef struct _AEGIS_PID_INPUT {
     ULONG Pid;
 } AEGIS_PID_INPUT, *PAEGIS_PID_INPUT;
+
+// -----------------------------------------------
+// Input: add/remove protected memory range [Low, High) for a process (interval tree)
+// -----------------------------------------------
+typedef struct _AEGIS_RANGE_INPUT {
+    ULONG    Pid;
+    ULONG_PTR Low;   // inclusive
+    ULONG_PTR High;  // exclusive: interval [Low, High)
+} AEGIS_RANGE_INPUT, *PAEGIS_RANGE_INPUT;
 
 // -----------------------------------------------
 // Output: status (e.g. after GET_STATUS or returned in buffer for PROTECT/UNPROTECT)

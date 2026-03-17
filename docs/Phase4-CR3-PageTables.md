@@ -65,3 +65,14 @@ The driver **implements** the following (see `driver.c`):
    - For each **committed** region from **ZwQueryVirtualMemory**, if the **VAD protection** says non-executable (no execute bits) but the **PTE** has **NX bit clear** (page is executable), record a **discrepancy**. This indicates possible PTE tampering (e.g. NX stripped to run shellcode). The scan output includes **DiscrepancyCount** and an array of **Discrepancies** (VA, VadProtect, PteValue).
 
 **Caveats**: Behaviour with **VBS/HVCI** or **5-level paging** may differ. Use in a test (e.g. VM) environment.
+
+---
+
+## 5. Memory range spatial index (interval tree)
+
+To support **fine-grained** protection (e.g. protecting a game’s anti-cheat `.text` section by address range), the driver maintains an **interval tree** per process:
+
+- **Structure**: For each PID that has at least one protected range, the driver keeps a BST keyed by `[Low, High)` with an augmented **MaxHigh** in each node. This allows **point-in-interval** queries in **O(log N)**.
+- **API**: `AegisIsAddressInProtectedRange(Pid, Address)` returns TRUE if the given virtual address falls inside any registered range for that process. Use this in future memory read/write interception or hidden scans.
+- **IOCTLs**: `IOCTL_AEGIS_ADD_RANGE` and `IOCTL_AEGIS_REMOVE_RANGE` (input: `Pid`, `Low`, `High`) add or remove one interval. Limits: `AEGIS_MAX_RANGE_CONTEXTS` (PIDs with ranges), `AEGIS_MAX_RANGES_PER_PID` (intervals per process).
+- **Client**: `addrange <PID> <Low_hex> <High_hex>` and `removerange <PID> <Low_hex> <High_hex>` for testing.

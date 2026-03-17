@@ -40,7 +40,10 @@ static void PrintUsage(const char* prog)
     printf("  %s unprotect <PID> - Remove PID from protected list\n", prog);
     printf("  %s status         - Show protected count and driver status\n", prog);
     printf("  %s scan <PID>      - Scan process for unbacked RWX regions (Phase 4)\n", prog);
+    printf("  %s addrange <PID> <Low_hex> <High_hex> - Add protected memory range [Low, High) for PID\n", prog);
+    printf("  %s removerange <PID> <Low_hex> <High_hex> - Remove protected memory range for PID\n", prog);
     printf("\nExample: %s protect 1234\n", prog);
+    printf("Example: %s addrange 1234 0x140000000 0x140010000\n", prog);
 }
 
 int main(int argc, char** argv)
@@ -180,6 +183,68 @@ int main(int argc, char** argv)
             }
         } else {
             printf("VAD scan failed: status 0x%X, GetLastError %lu\n", scanOut.StatusCode, GetLastError());
+        }
+    } else if (_stricmp(argv[1], "addrange") == 0) {
+        AEGIS_RANGE_INPUT rangeIn;
+        if (argc < 5) {
+            PrintUsage(argv[0]);
+            CloseHandle(hDev);
+            return 1;
+        }
+        rangeIn.Pid = (ULONG)atoi(argv[2]);
+        rangeIn.Low = (ULONG_PTR)_strtoui64(argv[3], NULL, 0);
+        rangeIn.High = (ULONG_PTR)_strtoui64(argv[4], NULL, 0);
+        if (rangeIn.Pid == 0 || rangeIn.Low >= rangeIn.High) {
+            fprintf(stderr, "Invalid PID or range (Low must be < High)\n");
+            CloseHandle(hDev);
+            return 1;
+        }
+        ZeroMemory(&out, sizeof(out));
+        ok = DeviceIoControl(
+            hDev,
+            IOCTL_AEGIS_ADD_RANGE,
+            &rangeIn,
+            sizeof(rangeIn),
+            &out,
+            sizeof(out),
+            &bytesReturned,
+            NULL
+        );
+        if (ok && out.StatusCode == 0) {
+            printf("OK: added range [%p, %p) for PID %u\n", (void*)rangeIn.Low, (void*)rangeIn.High, rangeIn.Pid);
+        } else {
+            printf("Failed: addrange (status 0x%X, GetLastError %lu)\n", out.StatusCode, GetLastError());
+        }
+    } else if (_stricmp(argv[1], "removerange") == 0) {
+        AEGIS_RANGE_INPUT rangeIn;
+        if (argc < 5) {
+            PrintUsage(argv[0]);
+            CloseHandle(hDev);
+            return 1;
+        }
+        rangeIn.Pid = (ULONG)atoi(argv[2]);
+        rangeIn.Low = (ULONG_PTR)_strtoui64(argv[3], NULL, 0);
+        rangeIn.High = (ULONG_PTR)_strtoui64(argv[4], NULL, 0);
+        if (rangeIn.Pid == 0) {
+            fprintf(stderr, "Invalid PID\n");
+            CloseHandle(hDev);
+            return 1;
+        }
+        ZeroMemory(&out, sizeof(out));
+        ok = DeviceIoControl(
+            hDev,
+            IOCTL_AEGIS_REMOVE_RANGE,
+            &rangeIn,
+            sizeof(rangeIn),
+            &out,
+            sizeof(out),
+            &bytesReturned,
+            NULL
+        );
+        if (ok && out.StatusCode == 0) {
+            printf("OK: removed range [%p, %p) for PID %u\n", (void*)rangeIn.Low, (void*)rangeIn.High, rangeIn.Pid);
+        } else {
+            printf("Failed: removerange (status 0x%X, GetLastError %lu)\n", out.StatusCode, GetLastError());
         }
     } else {
         PrintUsage(argv[0]);
