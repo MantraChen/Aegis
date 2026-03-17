@@ -17,6 +17,7 @@ extern "C" {
 #define AEGIS_MAX_PROTECTED_PIDS   64  // max PIDs that can be added via IOCTL
 #define AEGIS_MAX_IMAGE_NAME_LEN  260
 #define AEGIS_MAX_BLACKLIST_NAMES  16  // process names to block (e.g. cheat tools)
+#define AEGIS_MAX_WHITELIST_NAMES  24  // process names allowed to open protected process with full access (Phase 3)
 
 // Default protected names (defined in driver.c; can switch to IOCTL later)
 extern const wchar_t* AegisDefaultProtectedNames[];
@@ -25,6 +26,11 @@ extern const ULONG AegisDefaultProtectedCount;
 // Blacklist: processes that are blocked from starting (Phase 2 - process notify)
 extern const wchar_t* AegisBlacklistProcessNames[];
 extern const ULONG AegisBlacklistProcessCount;
+
+// Whitelist: processes allowed to open protected process with full access (Phase 3 - Ob callbacks)
+// Narrow string to match PsGetProcessImageFileName() output (ASCII, may be truncated to 15 chars on some builds)
+extern const char* AegisWhitelistProcessNames[];
+extern const ULONG AegisWhitelistProcessCount;
 
 // -----------------------------------------------
 // Feature flags (for staged development and debugging)

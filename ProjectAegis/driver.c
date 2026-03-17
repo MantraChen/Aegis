@@ -35,6 +35,23 @@ const wchar_t* AegisBlacklistProcessNames[] = {
 const ULONG AegisBlacklistProcessCount = sizeof(AegisBlacklistProcessNames) / sizeof(AegisBlacklistProcessNames[0]);
 
 // -----------------------------------------------
+// Whitelist: processes allowed to open protected process with full access (Phase 3 - Ob callbacks)
+// ASCII to match PsGetProcessImageFileName(); system + anti-cheat service
+// -----------------------------------------------
+const char* AegisWhitelistProcessNames[] = {
+    "System",
+    "csrss.exe",
+    "services.exe",
+    "wininit.exe",
+    "lsass.exe",
+    "svchost.exe",
+    "AegisClient.exe",
+    "GameClient.exe",   /* game itself may open its own handle in some flows */
+    "TestProtected.exe",
+};
+const ULONG AegisWhitelistProcessCount = sizeof(AegisWhitelistProcessNames) / sizeof(AegisWhitelistProcessNames[0]);
+
+// -----------------------------------------------
 // PID list (dynamic via IOCTL); protected PIDs added by user-mode client
 // -----------------------------------------------
 static ULONG g_ProtectedPids[AEGIS_MAX_PROTECTED_PIDS];
@@ -64,8 +81,14 @@ static void AegisLoadImageNotifyCallback(
 static BOOLEAN g_AegisProcessNotifyRegistered = FALSE;
 static BOOLEAN g_AegisThreadNotifyRegistered = FALSE;
 static BOOLEAN g_AegisImageNotifyRegistered = FALSE;
+static PVOID g_ObCallbackHandle = NULL;
 
 static BOOLEAN AegisIsProcessBlacklisted(PCUNICODE_STRING ImageName);
+static BOOLEAN AegisIsProcessWhitelisted(PEPROCESS Process);
+static OB_PREOP_CALLBACK_STATUS AegisObPreOperationCallback(
+    _In_ PVOID RegistrationContext,
+    _Inout_ POB_PRE_OPERATION_INFORMATION OperationInformation
+);
 
 // -----------------------------------------------
 // DriverEntry / Unload
@@ -348,6 +371,9 @@ BOOLEAN AegisIsProcessProtectedByImageName(PCUNICODE_STRING ImageName)
 NTSTATUS AegisRegisterCallbacks(void)
 {
     NTSTATUS status;
+    UNICODE_STRING altitude;
+    OB_CALLBACK_REGISTRATION obReg;
+    OB_OPERATION_REGISTRATION obOpReg[1];
 
     status = PsSetCreateThreadNotifyRoutine(AegisThreadNotifyCallback);
     if (!NT_SUCCESS(status)) {
@@ -365,11 +391,37 @@ NTSTATUS AegisRegisterCallbacks(void)
     }
     g_AegisImageNotifyRegistered = TRUE;
 
+    /* Phase 3: ObRegisterCallbacks for process handle create/duplicate */
+    RtlInitUnicodeString(&altitude, L"320000.123");
+    obOpReg[0].ObjectType = PsProcessType;
+    obOpReg[0].Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
+    obOpReg[0].PreOperation = AegisObPreOperationCallback;
+    obOpReg[0].PostOperation = NULL;
+    obReg.Version = OB_FLT_REGISTRATION_VERSION;
+    obReg.OperationRegistrationCount = 1;
+    obReg.Altitude = altitude;
+    obReg.RegistrationContext = NULL;
+    obReg.OperationRegistration = obOpReg;
+
+    status = ObRegisterCallbacks(&obReg, &g_ObCallbackHandle);
+    if (!NT_SUCCESS(status)) {
+        AegisDbgPrint(("[Aegis] ObRegisterCallbacks failed: 0x%X\n", status));
+        PsRemoveLoadImageNotifyRoutine(AegisLoadImageNotifyCallback);
+        g_AegisImageNotifyRegistered = FALSE;
+        PsRemoveCreateThreadNotifyRoutine(AegisThreadNotifyCallback);
+        g_AegisThreadNotifyRegistered = FALSE;
+        return status;
+    }
+
     return STATUS_SUCCESS;
 }
 
 void AegisUnregisterCallbacks(void)
 {
+    if (g_ObCallbackHandle != NULL) {
+        ObUnRegisterCallbacks(g_ObCallbackHandle);
+        g_ObCallbackHandle = NULL;
+    }
     if (g_AegisImageNotifyRegistered) {
         PsRemoveLoadImageNotifyRoutine(AegisLoadImageNotifyCallback);
         g_AegisImageNotifyRegistered = FALSE;
@@ -378,6 +430,68 @@ void AegisUnregisterCallbacks(void)
         PsRemoveCreateThreadNotifyRoutine(AegisThreadNotifyCallback);
         g_AegisThreadNotifyRegistered = FALSE;
     }
+}
+
+// -----------------------------------------------
+// Phase 3: Ob pre-callback – strip handle rights for non-whitelisted openers of protected process
+// -----------------------------------------------
+static BOOLEAN AegisIsProcessWhitelisted(PEPROCESS Process)
+{
+    ULONG i;
+    const char* imageName;
+
+    if (Process == NULL) return FALSE;
+    imageName = PsGetProcessImageFileName(Process);
+    if (imageName == NULL) return FALSE;
+
+    for (i = 0; i < AegisWhitelistProcessCount; i++) {
+        ANSI_STRING aCur, aList;
+        RtlInitAnsiString(&aCur, imageName);
+        RtlInitAnsiString(&aList, (PCHAR)AegisWhitelistProcessNames[i]);
+        if (RtlCompareString(&aCur, &aList, TRUE) == 0)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static OB_PREOP_CALLBACK_STATUS AegisObPreOperationCallback(
+    _In_ PVOID RegistrationContext,
+    _Inout_ POB_PRE_OPERATION_INFORMATION OperationInformation
+)
+{
+    PEPROCESS targetProcess;
+    PEPROCESS creatorProcess;
+    PACCESS_MASK pDesiredAccess;
+
+    UNREFERENCED_PARAMETER(RegistrationContext);
+
+    if (OperationInformation->KernelHandle)
+        return OB_PREOP_SUCCESS;
+
+    if (OperationInformation->ObjectType != PsProcessType)
+        return OB_PREOP_SUCCESS;
+
+    targetProcess = (PEPROCESS)OperationInformation->Object;
+    if (!AegisIsProcessProtected(targetProcess))
+        return OB_PREOP_SUCCESS;
+
+    creatorProcess = PsGetCurrentProcess();
+    if (AegisIsProcessWhitelisted(creatorProcess))
+        return OB_PREOP_SUCCESS;
+
+    /* Non-whitelisted process opening/duplicating handle to protected process – strip to query-only */
+    if (OperationInformation->Operation == OB_OPERATION_HANDLE_CREATE) {
+        pDesiredAccess = &OperationInformation->Parameters->CreateHandleInformation.DesiredAccess;
+    } else if (OperationInformation->Operation == OB_OPERATION_HANDLE_DUPLICATE) {
+        pDesiredAccess = &OperationInformation->Parameters->DuplicateHandleInformation.DesiredAccess;
+    } else {
+        return OB_PREOP_SUCCESS;
+    }
+
+    *pDesiredAccess = PROCESS_QUERY_LIMITED_INFORMATION;
+    AegisDbgPrint(("[Aegis] Ob: stripped handle access for PID %p -> protected process\n", PsGetCurrentProcessId()));
+
+    return OB_PREOP_SUCCESS;
 }
 
 // -----------------------------------------------

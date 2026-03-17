@@ -123,20 +123,41 @@ No SSDT hooking (PatchGuard/KPP); only official callback APIs.
 
 ---
 
-## Current implementation (Phase 1 + Phase 2)
+## Phase 3: Object protection and handle stripping (core defense)
 
-- **Driver**: Device, IOCTL, protected PID list, process/thread/image callbacks (see above).
+Cheats often use `OpenProcess` with `PROCESS_VM_READ` (or `PROCESS_ALL_ACCESS`) to read game memory. Phase 3 uses **ObRegisterCallbacks** to strip those rights for untrusted openers.
+
+**Task 1 – ObRegisterCallbacks**  
+- The driver registers an **ObjectPreCallback** for **process** handle operations: **OB_OPERATION_HANDLE_CREATE** and **OB_OPERATION_HANDLE_DUPLICATE**.  
+- Altitude used: `320000.123` (third-party range).
+
+**Task 2 – Handle stripping**  
+- When a **non-whitelisted** process opens or duplicates a handle to a **protected** process, the pre-callback sets the granted access to **PROCESS_QUERY_LIMITED_INFORMATION** only (no `PROCESS_VM_READ`, `PROCESS_VM_WRITE`, `PROCESS_TERMINATE`, etc.).  
+- Kernel handles (`KernelHandle == TRUE`) are left unchanged.  
+- Result: user-mode cheats that call `OpenProcess(PROCESS_ALL_ACCESS)` get a handle that cannot read/write memory or terminate the game.
+
+**Task 3 – Whitelist**  
+- **Whitelisted** processes are allowed to receive full requested access when opening the protected process.  
+- Whitelist (by image name, ASCII, from `PsGetProcessImageFileName`) includes: **System**, **csrss.exe**, **services.exe**, **wininit.exe**, **lsass.exe**, **svchost.exe**, **AegisClient.exe**, and the game images **GameClient.exe** / **TestProtected.exe**.  
+- Any other process (e.g. a cheat or unknown tool) gets stripped access as above.
+
+---
+
+## Current implementation (Phase 1 + Phase 2 + Phase 3)
+
+- **Driver**: Device, IOCTL, protected PID list, process/thread/image callbacks, **Ob process callbacks**.
 - **Process**: Blacklist block + protected-process creation log.
 - **Thread**: Remote threads in protected processes are terminated.
 - **Image**: All image loads into protected processes are logged.
+- **Ob**: Process handle create/duplicate are intercepted; non-whitelisted openers of protected process get **query-only** handle (no VM read/write/terminate).
 
 ---
 
 ## Possible extensions
 
-- **Read/write protection**: `ObRegisterCallbacks` to restrict handles, or hook `NtReadVirtualMemory` / `NtWriteVirtualMemory`.
+- **Thread handles**: Register Ob callbacks for `PsThreadType` to restrict thread handle rights (e.g. block `THREAD_SET_CONTEXT` from untrusted processes).
 - **Image load**: Block specific DLLs (e.g. unsigned) loading into protected process (e.g. via CI or custom logic).
-- **Dynamic protected list**: Add/remove protected names or PIDs via registry or user-mode IOCTL.
+- **Dynamic lists**: Add/remove protected or whitelist names/PIDs via registry or IOCTL.
 
 ---
 
