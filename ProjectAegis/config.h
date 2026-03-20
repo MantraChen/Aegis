@@ -63,6 +63,9 @@ extern const ULONG AegisBlacklistDllCount;
 // 当你通过特征码扫描/符号信息确定 EPROCESS 中 DirectoryTableBase 的偏移后，
 // 可以把 AEGIS_HAS_EPROCESS_CR3_OFFSET 设为 1，并设置正确的 AEGIS_EPROCESS_CR3_OFFSET，
 // 这样 AegisGetProcessCr3 就会直接从 EPROCESS 读取 CR3，而不再使用 KeStackAttachProcess。
+// 注意：该偏移与系统版本强相关，Windows 小版本/补丁都可能变化。生产环境建议：
+// 1) 动态解析偏移（符号/特征码）；
+// 2) 保留运行时校验与安全回退路径（当前 driver.c 已包含回退到 attach 读 CR3 的逻辑）。
 #define AEGIS_HAS_EPROCESS_CR3_OFFSET   0
 #define AEGIS_EPROCESS_CR3_OFFSET       0x0
 

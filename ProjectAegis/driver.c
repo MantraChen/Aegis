@@ -245,6 +245,12 @@ static void AegisPolicyRebuildBloom(void)
 static volatile ULONG g_ProtectedPids[AEGIS_MAX_PROTECTED_PIDS];
 static volatile LONG g_ProtectedPidCount = 0;
 
+/* x64 上自然对齐的 32-bit 读是原子的；这里避免只读路径使用总线锁指令。 */
+static __forceinline ULONG AegisReadProtectedPidCount(void)
+{
+    return (ULONG)g_ProtectedPidCount;
+}
+
 // -----------------------------------------------
 // Memory range protection: interval tree per process, O(log N) point-in-range query
 // -----------------------------------------------
@@ -474,7 +480,7 @@ static NTSTATUS AegisDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In
         /* Already in list? (lock-free read) */
         for (i = 0; i < AEGIS_MAX_PROTECTED_PIDS; i++) {
             if (g_ProtectedPids[i] == in->Pid) {
-                outData.ProtectedCount = (ULONG)InterlockedOr(&g_ProtectedPidCount, 0);
+                outData.ProtectedCount = AegisReadProtectedPidCount();
                 outData.StatusCode = 0;
                 inserted = TRUE;
                 break;
@@ -484,7 +490,7 @@ static NTSTATUS AegisDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In
             for (i = 0; i < AEGIS_MAX_PROTECTED_PIDS; i++) {
                 if (InterlockedCompareExchange((LONG*)&g_ProtectedPids[i], (LONG)in->Pid, 0) == 0) {
                     InterlockedIncrement(&g_ProtectedPidCount);
-                    outData.ProtectedCount = (ULONG)InterlockedOr(&g_ProtectedPidCount, 0);
+                    outData.ProtectedCount = AegisReadProtectedPidCount();
                     outData.StatusCode = 0;
                     inserted = TRUE;
                     break;
@@ -494,7 +500,7 @@ static NTSTATUS AegisDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In
         if (!inserted) {
             status = STATUS_TOO_MANY_NAMES;
             outData.StatusCode = (ULONG)status;
-            outData.ProtectedCount = (ULONG)InterlockedOr(&g_ProtectedPidCount, 0);
+            outData.ProtectedCount = AegisReadProtectedPidCount();
         }
         AegisDbgPrint(("[Aegis] IOCTL protect PID %u; total %u\n", in->Pid, outData.ProtectedCount));
         break;
@@ -515,13 +521,13 @@ static NTSTATUS AegisDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In
                 break;
             }
         }
-        outData.ProtectedCount = (ULONG)InterlockedOr(&g_ProtectedPidCount, 0);
+        outData.ProtectedCount = AegisReadProtectedPidCount();
         outData.StatusCode = found ? 0 : (ULONG)STATUS_NOT_FOUND;
         AegisDbgPrint(("[Aegis] IOCTL unprotect PID %u; total %u\n", in->Pid, outData.ProtectedCount));
         break;
     }
     case IOCTL_AEGIS_GET_STATUS:
-        outData.ProtectedCount = (ULONG)InterlockedOr(&g_ProtectedPidCount, 0);
+        outData.ProtectedCount = AegisReadProtectedPidCount();
         outData.StatusCode = 0;
         if (outSize < sizeof(AEGIS_STATUS_OUTPUT)) {
             status = STATUS_BUFFER_TOO_SMALL;
@@ -645,9 +651,15 @@ static ULONG64 AegisGetProcessCr3(_In_ PEPROCESS Process)
     if (Process == NULL) return 0;
 
 #if AEGIS_HAS_EPROCESS_CR3_OFFSET
-    cr3 = *(ULONG64 *)((PUCHAR)Process + AEGIS_EPROCESS_CR3_OFFSET);
-    return cr3 & AEGIS_PFN_MASK;
-#else
+    {
+        ULONG64 candidate = *(volatile ULONG64 *)((PUCHAR)Process + AEGIS_EPROCESS_CR3_OFFSET);
+        candidate &= AEGIS_PFN_MASK;
+        if (candidate != 0 && (candidate & (AEGIS_PAGE_SIZE - 1)) == 0)
+            return candidate;
+        AegisDbgPrint(("[Aegis] EPROCESS CR3 offset read invalid (0x%llX), fallback to attach path\n", candidate));
+    }
+#endif
+
     {
         KAPC_STATE apcState;
         KeStackAttachProcess(Process, &apcState);
@@ -655,7 +667,6 @@ static ULONG64 AegisGetProcessCr3(_In_ PEPROCESS Process)
         KeUnstackDetachProcess(&apcState);
         return cr3 & AEGIS_PFN_MASK;
     }
-#endif
 }
 
 static ULONG64 AegisReadPhysical(ULONG64 Pa)
@@ -939,16 +950,17 @@ static NTSTATUS AegisScanProcessVad(_In_ ULONG Pid, _Out_ PAEGIS_VAD_SCAN_OUTPUT
         }
 
         /* PTE-VAD discrepancy: VAD says non-executable but low-level PTE backend报告为可执行（可能的 PTE / EPT 篡改） */
-        if (cr3 != 0 && mbi.State == MEM_COMMIT && discCount < AEGIS_MAX_PTE_DISCREPANCY) {
-            if ((mbi.Protect & AEGIS_VAD_EXEC_MASK) == 0) {
-                ULONG64 pte = AegisQueryPteForVa(cr3, (ULONG_PTR)mbi.BaseAddress);
+        if ((mbi.Protect & AEGIS_VAD_EXEC_MASK) == 0) {
+            ULONG_PTR va;
+            for (va = (ULONG_PTR)mbi.BaseAddress; va < (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize; va += AEGIS_PAGE_SIZE) {
+                ULONG64 pte = AegisQueryPteForVa(cr3, va);
                 if (pte != 0 && (pte & AEGIS_PTE_NX) == 0) {
-                    Output->Discrepancies[discCount].Va = (ULONG_PTR)mbi.BaseAddress;
+                    // 记录异常，并可考虑直接 break 避免单区域记录过多导致数组越界
+                    Output->Discrepancies[discCount].Va = va;
                     Output->Discrepancies[discCount].VadProtect = mbi.Protect;
                     Output->Discrepancies[discCount].PteValue = pte;
                     discCount++;
-                    AegisDbgPrint(("[Aegis] PTE-VAD discrepancy PID %u: VA %p VAD protect 0x%X PTE 0x%llX (NX clear)\n",
-                        Pid, mbi.BaseAddress, mbi.Protect, pte));
+                    break; 
                 }
             }
         }
